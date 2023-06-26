@@ -45,7 +45,7 @@ func DeviceIDFromString(s string) (DeviceID, error) {
 func DeviceIDFromBytes(bs []byte) (DeviceID, error) {
 	var n DeviceID
 	if len(bs) != len(n) {
-		return n, fmt.Errorf("incorrect length of byte slice representing device ID")
+		return n, errors.New("incorrect length of byte slice representing device ID")
 	}
 	copy(n[:], bs)
 	return n, nil
@@ -84,7 +84,7 @@ func (n DeviceID) Short() ShortID {
 	return ShortID(binary.BigEndian.Uint64(n[:]))
 }
 
-func (n *DeviceID) MarshalText() ([]byte, error) {
+func (n DeviceID) MarshalText() ([]byte, error) {
 	return []byte(n.String()), nil
 }
 
@@ -129,7 +129,7 @@ func (n *DeviceID) UnmarshalText(bs []byte) error {
 	}
 }
 
-func (n *DeviceID) ProtoSize() int {
+func (*DeviceID) ProtoSize() int {
 	// Used by protobuf marshaller.
 	return DeviceIDLength
 }
@@ -203,29 +203,14 @@ func chunkify(s string) string {
 }
 
 func unchunkify(s string) string {
-	s = strings.Replace(s, "-", "", -1)
-	s = strings.Replace(s, " ", "", -1)
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, " ", "")
 	return s
 }
 
 func untypeoify(s string) string {
-	s = strings.Replace(s, "0", "O", -1)
-	s = strings.Replace(s, "1", "I", -1)
-	s = strings.Replace(s, "8", "B", -1)
+	s = strings.ReplaceAll(s, "0", "O")
+	s = strings.ReplaceAll(s, "1", "I")
+	s = strings.ReplaceAll(s, "8", "B")
 	return s
-}
-
-// DeviceIDs is a sortable slice of DeviceID
-type DeviceIDs []DeviceID
-
-func (l DeviceIDs) Len() int {
-	return len(l)
-}
-
-func (l DeviceIDs) Less(a, b int) bool {
-	return l[a].Compare(l[b]) == -1
-}
-
-func (l DeviceIDs) Swap(a, b int) {
-	l[a], l[b] = l[b], l[a]
 }

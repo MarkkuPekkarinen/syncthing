@@ -4,6 +4,7 @@ package protocol
 
 import (
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -16,6 +17,7 @@ var (
 	ResponseSuccess           = Response{0, "success"}
 	ResponseNotFound          = Response{1, "not found"}
 	ResponseAlreadyConnected  = Response{2, "already connected"}
+	ResponseWrongToken        = Response{3, "wrong token"}
 	ResponseUnexpectedMessage = Response{100, "unexpected message"}
 )
 
@@ -86,6 +88,9 @@ func ReadMessage(r io.Reader) (interface{}, error) {
 	if header.magic != magic {
 		return nil, errors.New("magic mismatch")
 	}
+	if header.messageLength < 0 || header.messageLength > 1024 {
+		return nil, fmt.Errorf("bad length (%d)", header.messageLength)
+	}
 
 	buf = make([]byte, int(header.messageLength))
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -103,6 +108,14 @@ func ReadMessage(r io.Reader) (interface{}, error) {
 		return msg, err
 	case messageTypeJoinRelayRequest:
 		var msg JoinRelayRequest
+
+		// In prior versions of the protocol JoinRelayRequest did not have a
+		// token field. Trying to unmarshal such a request will result in
+		// an error, return msg with an empty token instead.
+		if header.messageLength == 0 {
+			return msg, nil
+		}
+
 		err := msg.UnmarshalXDR(buf)
 		return msg, err
 	case messageTypeJoinSessionRequest:

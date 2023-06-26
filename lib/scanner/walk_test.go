@@ -9,24 +9,23 @@ package scanner
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"runtime"
 	rdebug "runtime/debug"
 	"sort"
 	"sync"
 	"testing"
 
 	"github.com/d4l3k/messagediff"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/sha256"
 	"golang.org/x/text/unicode/norm"
 )
@@ -39,37 +38,66 @@ type testfile struct {
 
 type testfileList []testfile
 
-var (
-	testFs     fs.Filesystem
-	testFsType = fs.FilesystemTypeBasic
-	testdata   = testfileList{
-		{"afile", 4, "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"},
-		{"dir1", 128, ""},
-		{filepath.Join("dir1", "dfile"), 5, "49ae93732fcf8d63fe1cce759664982dbd5b23161f007dba8561862adc96d063"},
-		{"dir2", 128, ""},
-		{filepath.Join("dir2", "cfile"), 4, "bf07a7fbb825fc0aae7bf4a1177b2b31fcf8a3feeaf7092761e18c859ee52a9c"},
-		{"excludes", 37, "df90b52f0c55dba7a7a940affe482571563b1ac57bd5be4d8a0291e7de928e06"},
-		{"further-excludes", 5, "7eb0a548094fa6295f7fd9200d69973e5f5ec5c04f2a86d998080ac43ecf89f1"},
-	}
-)
+var testdata = testfileList{
+	{"afile", 4, "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"},
+	{"dir1", 128, ""},
+	{filepath.Join("dir1", "dfile"), 5, "49ae93732fcf8d63fe1cce759664982dbd5b23161f007dba8561862adc96d063"},
+	{"dir2", 128, ""},
+	{filepath.Join("dir2", "cfile"), 4, "bf07a7fbb825fc0aae7bf4a1177b2b31fcf8a3feeaf7092761e18c859ee52a9c"},
+	{"excludes", 37, "df90b52f0c55dba7a7a940affe482571563b1ac57bd5be4d8a0291e7de928e06"},
+	{"further-excludes", 5, "7eb0a548094fa6295f7fd9200d69973e5f5ec5c04f2a86d998080ac43ecf89f1"},
+}
 
 func init() {
 	// This test runs the risk of entering infinite recursion if it fails.
 	// Limit the stack size to 10 megs to crash early in that case instead of
 	// potentially taking down the box...
 	rdebug.SetMaxStack(10 * 1 << 20)
+}
 
-	testFs = fs.NewFilesystem(fs.FilesystemTypeBasic, "testdata")
+func newTestFs(opts ...fs.Option) fs.Filesystem {
+	// This mirrors some test data we used to have in a physical `testdata`
+	// directory here.
+	tfs := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true&nostfolder=true", opts...)
+	tfs.Mkdir("dir1", 0o755)
+	tfs.Mkdir("dir2", 0o755)
+	tfs.Mkdir("dir3", 0o755)
+	tfs.MkdirAll("dir2/dir21/dir22/dir23", 0o755)
+	tfs.MkdirAll("dir2/dir21/dir22/efile", 0o755)
+	tfs.MkdirAll("dir2/dir21/dira", 0o755)
+	tfs.MkdirAll("dir2/dir21/efile/ign", 0o755)
+	fs.WriteFile(tfs, "dir1/cfile", []byte("baz\n"), 0o644)
+	fs.WriteFile(tfs, "dir1/dfile", []byte("quux\n"), 0o644)
+	fs.WriteFile(tfs, "dir2/cfile", []byte("baz\n"), 0o644)
+	fs.WriteFile(tfs, "dir2/dfile", []byte("quux\n"), 0o644)
+	fs.WriteFile(tfs, "dir2/dir21/dir22/dir23/efile", []byte("\n"), 0o644)
+	fs.WriteFile(tfs, "dir2/dir21/dir22/efile/efile", []byte("\n"), 0o644)
+	fs.WriteFile(tfs, "dir2/dir21/dir22/efile/ign/efile", []byte("\n"), 0o644)
+	fs.WriteFile(tfs, "dir2/dir21/dira/efile", []byte("\n"), 0o644)
+	fs.WriteFile(tfs, "dir2/dir21/dira/ffile", []byte("\n"), 0o644)
+	fs.WriteFile(tfs, "dir2/dir21/efile/ign/efile", []byte("\n"), 0o644)
+	fs.WriteFile(tfs, "dir2/dir21/cfile", []byte("foo\n"), 0o644)
+	fs.WriteFile(tfs, "dir2/dir21/dfile", []byte("quux\n"), 0o644)
+	fs.WriteFile(tfs, "dir3/cfile", []byte("foo\n"), 0o644)
+	fs.WriteFile(tfs, "dir3/dfile", []byte("quux\n"), 0o644)
+	fs.WriteFile(tfs, "afile", []byte("foo\n"), 0o644)
+	fs.WriteFile(tfs, "bfile", []byte("bar\n"), 0o644)
+	fs.WriteFile(tfs, ".stignore", []byte("#include excludes\n\nbfile\ndir1/cfile\n/dir2/dir21\n"), 0o644)
+	fs.WriteFile(tfs, "excludes", []byte("dir2/dfile\n#include further-excludes\n"), 0o644)
+	fs.WriteFile(tfs, "further-excludes", []byte("dir3\n"), 0o644)
+	return tfs
 }
 
 func TestWalkSub(t *testing.T) {
+	testFs := newTestFs()
 	ignores := ignore.New(testFs)
 	err := ignores.Load(".stignore")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cfg := testConfig()
+	cfg, cancel := testConfig()
+	defer cancel()
 	cfg.Subs = []string{"dir2"}
 	cfg.Matcher = ignores
 	fchan := Walk(context.TODO(), cfg)
@@ -96,6 +124,7 @@ func TestWalkSub(t *testing.T) {
 }
 
 func TestWalk(t *testing.T) {
+	testFs := newTestFs()
 	ignores := ignore.New(testFs)
 	err := ignores.Load(".stignore")
 	if err != nil {
@@ -103,7 +132,8 @@ func TestWalk(t *testing.T) {
 	}
 	t.Log(ignores)
 
-	cfg := testConfig()
+	cfg, cancel := testConfig()
+	defer cancel()
 	cfg.Matcher = ignores
 	fchan := Walk(context.TODO(), cfg)
 
@@ -119,6 +149,7 @@ func TestWalk(t *testing.T) {
 
 	if diff, equal := messagediff.PrettyDiff(testdata, files); !equal {
 		t.Errorf("Walk returned unexpected data. Diff:\n%s", diff)
+		t.Error(testdata[4], files[4])
 	}
 }
 
@@ -173,13 +204,12 @@ func TestVerify(t *testing.T) {
 }
 
 func TestNormalization(t *testing.T) {
-	if runtime.GOOS == "darwin" {
+	if build.IsDarwin {
 		t.Skip("Normalization test not possible on darwin")
 		return
 	}
 
-	os.RemoveAll("testdata/normalization")
-	defer os.RemoveAll("testdata/normalization")
+	testFs := newTestFs()
 
 	tests := []string{
 		"0-A",            // ASCII A -- accepted
@@ -192,18 +222,11 @@ func TestNormalization(t *testing.T) {
 	}
 	numInvalid := 2
 
-	if runtime.GOOS == "windows" {
-		// On Windows, in case 5 the character gets replaced with a
-		// replacement character \xEF\xBF\xBD at the point it's written to disk,
-		// which means it suddenly becomes valid (sort of).
-		numInvalid--
-	}
-
 	numValid := len(tests) - numInvalid
 
 	for _, s1 := range tests {
 		// Create a directory for each of the interesting strings above
-		if err := testFs.MkdirAll(filepath.Join("normalization", s1), 0755); err != nil {
+		if err := testFs.MkdirAll(filepath.Join("normalization", s1), 0o755); err != nil {
 			t.Fatal(err)
 		}
 
@@ -212,7 +235,7 @@ func TestNormalization(t *testing.T) {
 			// file names. Ensure that the file doesn't exist when it's
 			// created. This detects and fails if there's file name
 			// normalization stuff at the filesystem level.
-			if fd, err := testFs.OpenFile(filepath.Join("normalization", s1, s2), os.O_CREATE|os.O_EXCL, 0644); err != nil {
+			if fd, err := testFs.OpenFile(filepath.Join("normalization", s1, s2), os.O_CREATE|os.O_EXCL, 0o644); err != nil {
 				t.Fatal(err)
 			} else {
 				fd.Write([]byte("test"))
@@ -236,7 +259,7 @@ func TestNormalization(t *testing.T) {
 
 	expectedNum := numValid*numValid + numValid + 1
 	if len(files) != expectedNum {
-		t.Errorf("Expected %d files, got %d", expectedNum, len(files))
+		t.Errorf("Expected %d files, got %d, numvalid %d", expectedNum, len(files), numValid)
 	}
 
 	// The file names should all be in NFC form.
@@ -249,7 +272,63 @@ func TestNormalization(t *testing.T) {
 	}
 }
 
-func TestIssue1507(t *testing.T) {
+func TestNormalizationDarwinCaseFS(t *testing.T) {
+	// This tests that normalization works on Darwin, through a CaseFS.
+
+	if !build.IsDarwin {
+		t.Skip("Normalization test not possible on non-Darwin")
+		return
+	}
+
+	testFs := newTestFs(new(fs.OptionDetectCaseConflicts))
+
+	testFs.RemoveAll("normalization")
+	defer testFs.RemoveAll("normalization")
+	testFs.MkdirAll("normalization", 0o755)
+
+	const (
+		inNFC = "\xC3\x84"
+		inNFD = "\x41\xCC\x88"
+	)
+
+	// Create dir in NFC
+	if err := testFs.Mkdir(filepath.Join("normalization", "dir-"+inNFC), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create file in NFC
+	fd, err := testFs.Create(filepath.Join("normalization", "dir-"+inNFC, "file-"+inNFC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd.Close()
+
+	// Walk, which should normalize and return
+	walkDir(testFs, "normalization", nil, nil, 0)
+	tmp := walkDir(testFs, "normalization", nil, nil, 0)
+	if len(tmp) != 3 {
+		t.Error("Expected one file and one dir scanned")
+	}
+
+	// Verify we see the normalized entries in the result
+	foundFile := false
+	foundDir := false
+	for _, f := range tmp {
+		if f.Name == filepath.Join("normalization", "dir-"+inNFD) {
+			foundDir = true
+			continue
+		}
+		if f.Name == filepath.Join("normalization", "dir-"+inNFD, "file-"+inNFD) {
+			foundFile = true
+			continue
+		}
+	}
+	if !foundFile || !foundDir {
+		t.Error("Didn't find expected normalization form")
+	}
+}
+
+func TestIssue1507(_ *testing.T) {
 	w := &walker{}
 	w.Matcher = ignore.New(w.Filesystem)
 	h := make(chan protocol.FileInfo, 100)
@@ -260,18 +339,18 @@ func TestIssue1507(t *testing.T) {
 }
 
 func TestWalkSymlinkUnix(t *testing.T) {
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		t.Skip("skipping unsupported symlink test")
 		return
 	}
 
 	// Create a folder with a symlink in it
 	os.RemoveAll("_symlinks")
-	os.Mkdir("_symlinks", 0755)
+	os.Mkdir("_symlinks", 0o755)
 	defer os.RemoveAll("_symlinks")
 	os.Symlink("../testdata", "_symlinks/link")
 
-	fs := fs.NewFilesystem(testFsType, "_symlinks")
+	fs := fs.NewFilesystem(fs.FilesystemTypeBasic, "_symlinks")
 	for _, path := range []string{".", "link"} {
 		// Scan it
 		files := walkDir(fs, path, nil, nil, 0)
@@ -286,83 +365,6 @@ func TestWalkSymlinkUnix(t *testing.T) {
 		if files[0].SymlinkTarget != "../testdata" {
 			t.Errorf("expected symlink to have target destination, not %q", files[0].SymlinkTarget)
 		}
-	}
-}
-
-func TestWalkSymlinkWindows(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("skipping unsupported symlink test")
-	}
-
-	// Create a folder with a symlink in it
-	name := "_symlinks-win"
-	os.RemoveAll(name)
-	os.Mkdir(name, 0755)
-	defer os.RemoveAll(name)
-	testFs := fs.NewFilesystem(testFsType, name)
-	if err := fs.DebugSymlinkForTestsOnly(testFs, testFs, "../testdata", "link"); err != nil {
-		// Probably we require permissions we don't have.
-		t.Skip(err)
-	}
-
-	for _, path := range []string{".", "link"} {
-		// Scan it
-		files := walkDir(testFs, path, nil, nil, 0)
-
-		// Verify that we got zero symlinks
-		if len(files) != 0 {
-			t.Errorf("expected zero symlinks, not %d", len(files))
-		}
-	}
-}
-
-func TestWalkRootSymlink(t *testing.T) {
-	// Create a folder with a symlink in it
-	tmp, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmp)
-	testFs := fs.NewFilesystem(testFsType, tmp)
-
-	link := "link"
-	dest, _ := filepath.Abs("testdata/dir1")
-	destFs := fs.NewFilesystem(testFsType, dest)
-	if err := fs.DebugSymlinkForTestsOnly(destFs, testFs, ".", "link"); err != nil {
-		if runtime.GOOS == "windows" {
-			// Probably we require permissions we don't have.
-			t.Skip("Need admin permissions or developer mode to run symlink test on Windows: " + err.Error())
-		} else {
-			t.Fatal(err)
-		}
-	}
-
-	// Scan root with symlink at FS root
-	files := walkDir(fs.NewFilesystem(testFsType, filepath.Join(testFs.URI(), link)), ".", nil, nil, 0)
-
-	// Verify that we got two files
-	if len(files) != 2 {
-		t.Fatalf("expected two files, not %d", len(files))
-	}
-
-	// Scan symlink below FS root
-	files = walkDir(testFs, "link", nil, nil, 0)
-
-	// Verify that we got the one symlink, except on windows
-	if runtime.GOOS == "windows" {
-		if len(files) != 0 {
-			t.Errorf("expected no files, not %d", len(files))
-		}
-	} else if len(files) != 1 {
-		t.Errorf("expected one file, not %d", len(files))
-	}
-
-	// Scan path below symlink
-	files = walkDir(fs.NewFilesystem(testFsType, tmp), filepath.Join("link", "cfile"), nil, nil, 0)
-
-	// Verify that we get nothing
-	if len(files) != 0 {
-		t.Errorf("expected no files, not %d", len(files))
 	}
 }
 
@@ -486,14 +488,89 @@ func TestWalkReceiveOnly(t *testing.T) {
 	}
 }
 
+func TestScanOwnershipPOSIX(t *testing.T) {
+	// This test works on all operating systems because the FakeFS is always POSIXy.
+
+	fakeFS := fs.NewFilesystem(fs.FilesystemTypeFake, "TestScanOwnership")
+	current := make(fakeCurrentFiler)
+
+	fakeFS.Create("root-owned")
+	fakeFS.Create("user-owned")
+	fakeFS.Lchown("user-owned", "1234", "5678")
+	fakeFS.Mkdir("user-owned-dir", 0o755)
+	fakeFS.Lchown("user-owned-dir", "2345", "6789")
+
+	expected := []struct {
+		name     string
+		uid, gid int
+	}{
+		{"root-owned", 0, 0},
+		{"user-owned", 1234, 5678},
+		{"user-owned-dir", 2345, 6789},
+	}
+
+	files := walkDir(fakeFS, ".", current, nil, 0)
+	if len(files) != len(expected) {
+		t.Fatalf("expected %d items, not %d", len(expected), len(files))
+	}
+	for i := range expected {
+		if files[i].Name != expected[i].name {
+			t.Errorf("expected %s, got %s", expected[i].name, files[i].Name)
+			continue
+		}
+
+		if files[i].Platform.Unix == nil {
+			t.Error("failed to load POSIX data on", files[i].Name)
+			continue
+		}
+		if files[i].Platform.Unix.UID != expected[i].uid {
+			t.Errorf("expected %d, got %d", expected[i].uid, files[i].Platform.Unix.UID)
+		}
+		if files[i].Platform.Unix.GID != expected[i].gid {
+			t.Errorf("expected %d, got %d", expected[i].gid, files[i].Platform.Unix.GID)
+		}
+	}
+}
+
+func TestScanOwnershipWindows(t *testing.T) {
+	if !build.IsWindows {
+		t.Skip("This test only works on Windows")
+	}
+
+	testFS := fs.NewFilesystem(fs.FilesystemTypeBasic, t.TempDir())
+	current := make(fakeCurrentFiler)
+
+	fd, err := testFS.Create("user-owned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd.Close()
+
+	files := walkDir(testFS, ".", current, nil, 0)
+	if len(files) != 1 {
+		t.Fatalf("expected %d items, not %d", 1, len(files))
+	}
+	t.Log(files[0])
+
+	// The file should have an owner name set.
+	if files[0].Platform.Windows == nil {
+		t.Fatal("failed to load Windows data")
+	}
+	if files[0].Platform.Windows.OwnerName == "" {
+		t.Errorf("expected owner name to be set")
+	}
+}
+
 func walkDir(fs fs.Filesystem, dir string, cfiler CurrentFiler, matcher *ignore.Matcher, localFlags uint32) []protocol.FileInfo {
-	cfg := testConfig()
+	cfg, cancel := testConfig()
+	defer cancel()
 	cfg.Filesystem = fs
 	cfg.Subs = []string{dir}
 	cfg.AutoNormalize = true
 	cfg.CurrentFiler = cfiler
 	cfg.Matcher = matcher
 	cfg.LocalFlags = localFlags
+	cfg.ScanOwnership = true
 	fchan := Walk(context.TODO(), cfg)
 
 	var tmp []protocol.FileInfo
@@ -548,16 +625,17 @@ func (l testfileList) String() string {
 var initOnce sync.Once
 
 const (
-	testdataSize = 17 << 20
+	testdataSize = 17<<20 + 1
 	testdataName = "_random.data"
+	testFsPath   = "some_random_dir_path"
 )
 
 func BenchmarkHashFile(b *testing.B) {
-	initOnce.Do(initTestFile)
+	testFs := newDataFs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if _, err := HashFile(context.TODO(), fs.NewFilesystem(testFsType, ""), testdataName, protocol.MinBlockSize, nil, true); err != nil {
+		if _, err := HashFile(context.TODO(), testFs, testdataName, protocol.MinBlockSize, nil, true); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -566,8 +644,9 @@ func BenchmarkHashFile(b *testing.B) {
 	b.ReportAllocs()
 }
 
-func initTestFile() {
-	fd, err := os.Create(testdataName)
+func newDataFs() fs.Filesystem {
+	tfs := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	fd, err := tfs.Create(testdataName)
 	if err != nil {
 		panic(err)
 	}
@@ -580,6 +659,8 @@ func initTestFile() {
 	if err := fd.Close(); err != nil {
 		panic(err)
 	}
+
+	return tfs
 }
 
 func TestStopWalk(t *testing.T) {
@@ -596,7 +677,8 @@ func TestStopWalk(t *testing.T) {
 
 	const numHashers = 4
 	ctx, cancel := context.WithCancel(context.Background())
-	cfg := testConfig()
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
 	cfg.Filesystem = fs
 	cfg.Hashers = numHashers
 	cfg.ProgressTickIntervalS = -1 // Don't attempt to build the full list of files before starting to scan...
@@ -616,12 +698,12 @@ func TestStopWalk(t *testing.T) {
 		f := res.File
 		t.Log("Scanned", f)
 		if f.IsDirectory() {
-			if len(f.Name) == 0 || f.Permissions == 0 {
+			if f.Name == "" || f.Permissions == 0 {
 				t.Error("Bad directory entry", f)
 			}
 			dirs++
 		} else {
-			if len(f.Name) == 0 || len(f.Blocks) == 0 || f.Permissions == 0 {
+			if f.Name == "" || len(f.Blocks) == 0 || f.Permissions == 0 {
 				t.Error("Bad file entry", f)
 			}
 			files++
@@ -649,13 +731,7 @@ func TestStopWalk(t *testing.T) {
 }
 
 func TestIssue4799(t *testing.T) {
-	tmp, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmp)
-
-	fs := fs.NewFilesystem(testFsType, tmp)
+	fs := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16))
 
 	fd, err := fs.Create("foo")
 	if err != nil {
@@ -676,6 +752,7 @@ func TestRecurseInclude(t *testing.T) {
 	!ffile
 	*
 	`
+	testFs := newTestFs()
 	ignores := ignore.New(testFs, ignore.WithCache(true))
 	if err := ignores.Parse(bytes.NewBufferString(stignore), ".stignore"); err != nil {
 		t.Fatal(err)
@@ -701,7 +778,11 @@ func TestRecurseInclude(t *testing.T) {
 		filepath.Join("dir2", "dir21", "efile", "ign", "efile"),
 	}
 	if len(files) != len(expected) {
-		t.Fatalf("Got %d files %v, expected %d files at %v", len(files), files, len(expected), expected)
+		var filesString []string
+		for _, file := range files {
+			filesString = append(filesString, file.Name)
+		}
+		t.Fatalf("Got %d files %v, expected %d files at %v", len(files), filesString, len(expected), expected)
 	}
 	for i := range files {
 		if files[i].Name != expected[i] {
@@ -711,13 +792,7 @@ func TestRecurseInclude(t *testing.T) {
 }
 
 func TestIssue4841(t *testing.T) {
-	tmp, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmp)
-
-	fs := fs.NewFilesystem(testFsType, tmp)
+	fs := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16))
 
 	fd, err := fs.Create("foo")
 	if err != nil {
@@ -725,7 +800,8 @@ func TestIssue4841(t *testing.T) {
 	}
 	fd.Close()
 
-	cfg := testConfig()
+	cfg, cancel := testConfig()
+	defer cancel()
 	cfg.Filesystem = fs
 	cfg.AutoNormalize = true
 	cfg.CurrentFiler = fakeCurrentFiler{"foo": {
@@ -757,11 +833,13 @@ func TestIssue4841(t *testing.T) {
 // TestNotExistingError reproduces https://github.com/syncthing/syncthing/issues/5385
 func TestNotExistingError(t *testing.T) {
 	sub := "notExisting"
+	testFs := newTestFs()
 	if _, err := testFs.Lstat(sub); !fs.IsNotExist(err) {
 		t.Fatalf("Lstat returned error %v, while nothing should exist there.", err)
 	}
 
-	cfg := testConfig()
+	cfg, cancel := testConfig()
+	defer cancel()
 	cfg.Subs = []string{sub}
 	fchan := Walk(context.TODO(), cfg)
 	for f := range fchan {
@@ -773,7 +851,7 @@ func TestSkipIgnoredDirs(t *testing.T) {
 	fss := fs.NewFilesystem(fs.FilesystemTypeFake, "")
 
 	name := "foo/ignored"
-	err := fss.MkdirAll(name, 0777)
+	err := fss.MkdirAll(name, 0o777)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -813,7 +891,7 @@ func TestIncludedSubdir(t *testing.T) {
 	fss := fs.NewFilesystem(fs.FilesystemTypeFake, "")
 
 	name := filepath.Clean("foo/bar/included")
-	err := fss.MkdirAll(name, 0777)
+	err := fss.MkdirAll(name, 0o777)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -891,12 +969,35 @@ func (fcf fakeCurrentFiler) CurrentFile(name string) (protocol.FileInfo, bool) {
 	return f, ok
 }
 
-func testConfig() Config {
+func testConfig() (Config, context.CancelFunc) {
 	evLogger := events.NewLogger()
-	go evLogger.Serve()
+	ctx, cancel := context.WithCancel(context.Background())
+	go evLogger.Serve(ctx)
 	return Config{
-		Filesystem:  testFs,
+		Filesystem:  newTestFs(),
 		Hashers:     2,
 		EventLogger: evLogger,
+	}, cancel
+}
+
+func BenchmarkWalk(b *testing.B) {
+	testFs := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32))
+
+	for i := 0; i < 100; i++ {
+		if err := testFs.Mkdir(fmt.Sprintf("dir%d", i), 0o755); err != nil {
+			b.Fatal(err)
+		}
+		for j := 0; j < 100; j++ {
+			if fd, err := testFs.Create(fmt.Sprintf("dir%d/file%d", i, j)); err != nil {
+				b.Fatal(err)
+			} else {
+				fd.Close()
+			}
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		walkDir(testFs, "/", nil, nil, 0)
 	}
 }

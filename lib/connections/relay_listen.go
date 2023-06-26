@@ -9,17 +9,17 @@ package connections
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net/url"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/nat"
 	"github.com/syncthing/syncthing/lib/relay/client"
-	"github.com/syncthing/syncthing/lib/util"
+	"github.com/syncthing/syncthing/lib/svcutil"
 )
 
 func init() {
@@ -30,7 +30,7 @@ func init() {
 }
 
 type relayListener struct {
-	util.ServiceWithError
+	svcutil.ServiceWithError
 	onAddressesChangedNotifier
 
 	uri     *url.URL
@@ -44,39 +44,39 @@ type relayListener struct {
 }
 
 func (t *relayListener) serve(ctx context.Context) error {
-	clnt, err := client.NewClient(t.uri, t.tlsCfg.Certificates, nil, 10*time.Second)
+	clnt, err := client.NewClient(t.uri, t.tlsCfg.Certificates, 10*time.Second)
 	if err != nil {
 		l.Infoln("Listen (BEP/relay):", err)
 		return err
 	}
-	invitations := clnt.Invitations()
 
 	t.mut.Lock()
 	t.client = clnt
-	go clnt.Serve()
-	defer clnt.Stop()
 	t.mut.Unlock()
-
-	// Start with nil, so that we send a addresses changed notification as soon as we connect somewhere.
-	var oldURI *url.URL
 
 	l.Infof("Relay listener (%v) starting", t)
 	defer l.Infof("Relay listener (%v) shutting down", t)
 	defer t.clearAddresses(t)
 
+	invitationCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go t.handleInvitations(invitationCtx, clnt)
+
+	return clnt.Serve(ctx)
+}
+
+func (t *relayListener) handleInvitations(ctx context.Context, clnt client.RelayClient) {
+	invitations := clnt.Invitations()
+
+	// Start with nil, so that we send a addresses changed notification as soon as we connect somewhere.
+	var oldURI *url.URL
+
 	for {
 		select {
-		case inv, ok := <-invitations:
-			if !ok {
-				if err := clnt.Error(); err != nil {
-					l.Infoln("Listen (BEP/relay):", err)
-				}
-				return err
-			}
-
+		case inv := <-invitations:
 			conn, err := client.JoinSession(ctx, inv)
 			if err != nil {
-				if errors.Cause(err) != context.Canceled {
+				if !errors.Is(err, context.Canceled) {
 					l.Infoln("Listen (BEP/relay): joining session:", err)
 				}
 				continue
@@ -106,7 +106,7 @@ func (t *relayListener) serve(ctx context.Context) error {
 				continue
 			}
 
-			t.conns <- internalConn{tc, connTypeRelayServer, relayPriority}
+			t.conns <- newInternalConn(tc, connTypeRelayServer, false, t.cfg.Options().ConnectionPriorityRelay)
 
 		// Poor mans notifier that informs the connection service that the
 		// relay URI has changed. This can only happen when we connect to a
@@ -120,7 +120,7 @@ func (t *relayListener) serve(ctx context.Context) error {
 			}
 
 		case <-ctx.Done():
-			return nil
+			return
 		}
 	}
 }
@@ -171,13 +171,13 @@ func (t *relayListener) String() string {
 	return t.uri.String()
 }
 
-func (t *relayListener) NATType() string {
+func (*relayListener) NATType() string {
 	return "unknown"
 }
 
 type relayListenerFactory struct{}
 
-func (f *relayListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service) genericListener {
+func (f *relayListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, _ *nat.Service, _ *registry.Registry, _ *lanChecker) genericListener {
 	t := &relayListener{
 		uri:     uri,
 		cfg:     cfg,
@@ -185,7 +185,7 @@ func (f *relayListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls
 		conns:   conns,
 		factory: f,
 	}
-	t.ServiceWithError = util.AsServiceWithError(t.serve, t.String())
+	t.ServiceWithError = svcutil.AsService(t.serve, t.String())
 	return t
 }
 

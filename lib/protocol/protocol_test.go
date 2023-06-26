@@ -10,13 +10,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"io/ioutil"
-	"runtime"
+	"os"
 	"sync"
 	"testing"
 	"testing/quick"
 	"time"
 
+	lz4 "github.com/pierrec/lz4/v4"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/testutils"
 )
@@ -31,10 +32,12 @@ func TestPing(t *testing.T) {
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := NewConnection(c0ID, ar, bw, newTestModel(), "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	c0 := getRawConnection(NewConnection(c0ID, ar, bw, testutils.NoopCloser{}, newTestModel(), new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
 	c0.Start()
-	c1 := NewConnection(c1ID, br, aw, newTestModel(), "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	defer closeAndWait(c0, ar, bw)
+	c1 := getRawConnection(NewConnection(c1ID, br, aw, testutils.NoopCloser{}, newTestModel(), new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
 	c1.Start()
+	defer closeAndWait(c1, ar, bw)
 	c0.ClusterConfig(ClusterConfig{})
 	c1.ClusterConfig(ClusterConfig{})
 
@@ -55,10 +58,12 @@ func TestClose(t *testing.T) {
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := NewConnection(c0ID, ar, bw, m0, "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	c0 := getRawConnection(NewConnection(c0ID, ar, bw, testutils.NoopCloser{}, m0, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
 	c0.Start()
-	c1 := NewConnection(c1ID, br, aw, m1, "name", CompressAlways)
+	defer closeAndWait(c0, ar, bw)
+	c1 := NewConnection(c1ID, br, aw, testutils.NoopCloser{}, m1, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen)
 	c1.Start()
+	defer closeAndWait(c1, ar, bw)
 	c0.ClusterConfig(ClusterConfig{})
 	c1.ClusterConfig(ClusterConfig{})
 
@@ -80,7 +85,7 @@ func TestClose(t *testing.T) {
 	c0.Index(ctx, "default", nil)
 	c0.Index(ctx, "default", nil)
 
-	if _, err := c0.Request(ctx, "default", "foo", 0, 0, nil, 0, false); err == nil {
+	if _, err := c0.Request(ctx, "default", "foo", 0, 0, 0, nil, 0, false); err == nil {
 		t.Error("Request should return an error")
 	}
 }
@@ -97,8 +102,10 @@ func TestCloseOnBlockingSend(t *testing.T) {
 
 	m := newTestModel()
 
-	c := NewConnection(c0ID, &testutils.BlockingRW{}, &testutils.BlockingRW{}, m, "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	rw := testutils.NewBlockingRW()
+	c := getRawConnection(NewConnection(c0ID, rw, rw, testutils.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
 	c.Start()
+	defer closeAndWait(c, rw)
 
 	wg := sync.WaitGroup{}
 
@@ -147,10 +154,12 @@ func TestCloseRace(t *testing.T) {
 	ar, aw := io.Pipe()
 	br, bw := io.Pipe()
 
-	c0 := NewConnection(c0ID, ar, bw, m0, "c0", CompressNever).(wireFormatConnection).Connection.(*rawConnection)
+	c0 := getRawConnection(NewConnection(c0ID, ar, bw, testutils.NoopCloser{}, m0, new(mockedConnectionInfo), CompressionNever, nil, testKeyGen))
 	c0.Start()
-	c1 := NewConnection(c1ID, br, aw, m1, "c1", CompressNever)
+	defer closeAndWait(c0, ar, bw)
+	c1 := NewConnection(c1ID, br, aw, testutils.NoopCloser{}, m1, new(mockedConnectionInfo), CompressionNever, nil, testKeyGen)
 	c1.Start()
+	defer closeAndWait(c1, ar, bw)
 	c0.ClusterConfig(ClusterConfig{})
 	c1.ClusterConfig(ClusterConfig{})
 
@@ -184,8 +193,10 @@ func TestCloseRace(t *testing.T) {
 func TestClusterConfigFirst(t *testing.T) {
 	m := newTestModel()
 
-	c := NewConnection(c0ID, &testutils.BlockingRW{}, &testutils.NoopRW{}, m, "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	rw := testutils.NewBlockingRW()
+	c := getRawConnection(NewConnection(c0ID, rw, &testutils.NoopRW{}, testutils.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
 	c.Start()
+	defer closeAndWait(c, rw)
 
 	select {
 	case c.outbox <- asyncMessage{&Ping{}, nil}:
@@ -234,8 +245,10 @@ func TestCloseTimeout(t *testing.T) {
 
 	m := newTestModel()
 
-	c := NewConnection(c0ID, &testutils.BlockingRW{}, &testutils.BlockingRW{}, m, "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	rw := testutils.NewBlockingRW()
+	c := getRawConnection(NewConnection(c0ID, rw, rw, testutils.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
 	c.Start()
+	defer closeAndWait(c, rw)
 
 	done := make(chan struct{})
 	go func() {
@@ -260,6 +273,12 @@ func TestMarshalIndexMessage(t *testing.T) {
 			m1.Files = nil
 		}
 		for i, f := range m1.Files {
+			if len(f.BlocksHash) == 0 {
+				m1.Files[i].BlocksHash = nil
+			}
+			if len(f.VersionHash) == 0 {
+				m1.Files[i].VersionHash = nil
+			}
 			if len(f.Blocks) == 0 {
 				m1.Files[i].Blocks = nil
 			} else {
@@ -272,6 +291,9 @@ func TestMarshalIndexMessage(t *testing.T) {
 			}
 			if len(f.Version.Counters) == 0 {
 				m1.Files[i].Version.Counters = nil
+			}
+			if len(f.Encrypted) == 0 {
+				m1.Files[i].Encrypted = nil
 			}
 		}
 
@@ -330,7 +352,16 @@ func TestMarshalClusterConfigMessage(t *testing.T) {
 			if len(m1.Folders[i].Devices) == 0 {
 				m1.Folders[i].Devices = nil
 			}
+			for j := range m1.Folders[i].Devices {
+				if len(m1.Folders[i].Devices[j].Addresses) == 0 {
+					m1.Folders[i].Devices[j].Addresses = nil
+				}
+				if len(m1.Folders[i].Devices[j].EncryptionPasswordToken) == 0 {
+					m1.Folders[i].Devices[j].EncryptionPasswordToken = nil
+				}
+			}
 		}
+
 		return testMarshal(t, "clusterconfig", &m1, &ClusterConfig{})
 	}
 
@@ -362,7 +393,10 @@ func TestMarshalFDPU(t *testing.T) {
 		if len(m1.Version.Counters) == 0 {
 			m1.Version.Counters = nil
 		}
-		return testMarshal(t, "close", &m1, &FileDownloadProgressUpdate{})
+		if len(m1.BlockIndexes) == 0 {
+			m1.BlockIndexes = nil
+		}
+		return testMarshal(t, "fdpu", &m1, &FileDownloadProgressUpdate{})
 	}
 
 	if err := quick.Check(f, quickCfg); err != nil {
@@ -398,17 +432,50 @@ func testMarshal(t *testing.T, prefix string, m1, m2 message) bool {
 	bs1, _ := json.MarshalIndent(m1, "", "  ")
 	bs2, _ := json.MarshalIndent(m2, "", "  ")
 	if !bytes.Equal(bs1, bs2) {
-		ioutil.WriteFile(prefix+"-1.txt", bs1, 0644)
-		ioutil.WriteFile(prefix+"-2.txt", bs2, 0644)
+		os.WriteFile(prefix+"-1.txt", bs1, 0o644)
+		os.WriteFile(prefix+"-2.txt", bs2, 0o644)
 		return false
 	}
 
 	return true
 }
 
-func TestLZ4Compression(t *testing.T) {
-	c := new(rawConnection)
+func TestWriteCompressed(t *testing.T) {
+	for _, random := range []bool{false, true} {
+		buf := new(bytes.Buffer)
+		c := &rawConnection{
+			cr:          &countingReader{Reader: buf},
+			cw:          &countingWriter{Writer: buf},
+			compression: CompressionAlways,
+		}
 
+		msg := &Response{Data: make([]byte, 10240)}
+		if random {
+			// This should make the message uncompressible.
+			rand.Read(msg.Data)
+		}
+
+		if err := c.writeMessage(msg); err != nil {
+			t.Fatal(err)
+		}
+		got, err := c.readMessage(make([]byte, 4))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.(*Response).Data, msg.Data) {
+			t.Error("received the wrong message")
+		}
+
+		hdr := Header{Type: typeOf(msg)}
+		size := int64(2 + hdr.ProtoSize() + 4 + msg.ProtoSize())
+		if c.cr.Tot() > size {
+			t.Errorf("compression enlarged message from %d to %d",
+				size, c.cr.Tot())
+		}
+	}
+}
+
+func TestLZ4Compression(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		dataLen := 150 + rand.Intn(150)
 		data := make([]byte, dataLen)
@@ -416,13 +483,15 @@ func TestLZ4Compression(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		comp, err := c.lz4Compress(data)
+
+		comp := make([]byte, lz4.CompressBlockBound(dataLen))
+		compLen, err := lz4Compress(data, comp)
 		if err != nil {
 			t.Errorf("compressing %d bytes: %v", dataLen, err)
 			continue
 		}
 
-		res, err := c.lz4Decompress(comp)
+		res, err := lz4Decompress(comp[:compLen])
 		if err != nil {
 			t.Errorf("decompressing %d bytes to %d: %v", len(comp), dataLen, err)
 			continue
@@ -437,35 +506,33 @@ func TestLZ4Compression(t *testing.T) {
 	}
 }
 
-func TestStressLZ4CompressGrows(t *testing.T) {
-	c := new(rawConnection)
-	success := 0
-	for i := 0; i < 100; i++ {
-		// Create a slize that is precisely one min block size, fill it with
-		// random data. This shouldn't compress at all, so will in fact
-		// become larger when LZ4 does its thing.
-		data := make([]byte, MinBlockSize)
-		if _, err := rand.Reader.Read(data); err != nil {
-			t.Fatal("randomness failure")
-		}
+func TestLZ4CompressionUpdate(t *testing.T) {
+	uncompressed := []byte("this is some arbitrary yet fairly compressible data")
 
-		comp, err := c.lz4Compress(data)
-		if err != nil {
-			t.Fatal("unexpected compression error: ", err)
-		}
-		if len(comp) < len(data) {
-			// data size should grow. We must have been really unlucky in
-			// the random generation, try again.
-			continue
-		}
+	// Compressed, as created by the LZ4 implementation in Syncthing 1.18.6 and earlier.
+	oldCompressed, _ := hex.DecodeString("00000033f0247468697320697320736f6d65206172626974726172792079657420666169726c7920636f6d707265737369626c652064617461")
 
-		// Putting it into the buffer pool shouldn't panic because the block
-		// should come from there to begin with.
-		BufferPool.Put(comp)
-		success++
+	// Verify that we can decompress
+
+	res, err := lz4Decompress(oldCompressed)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if success == 0 {
-		t.Fatal("unable to find data that grows when compressed")
+	if !bytes.Equal(uncompressed, res) {
+		t.Fatal("result does not match")
+	}
+
+	// Verify that our current compression is equivalent
+
+	buf := make([]byte, 128)
+	n, err := lz4Compress(uncompressed, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(oldCompressed, buf[:n]) {
+		t.Logf("%x", oldCompressed)
+		t.Logf("%x", buf[:n])
+		t.Fatal("compression does not match")
 	}
 }
 
@@ -602,17 +669,17 @@ func TestLocalFlagBits(t *testing.T) {
 		t.Error("file should have no weird bits set by default")
 	}
 
-	f.SetIgnored(42)
+	f.SetIgnored()
 	if !f.IsIgnored() || f.MustRescan() || !f.IsInvalid() {
 		t.Error("file should be ignored and invalid")
 	}
 
-	f.SetMustRescan(42)
+	f.SetMustRescan()
 	if f.IsIgnored() || !f.MustRescan() || !f.IsInvalid() {
 		t.Error("file should be must-rescan and invalid")
 	}
 
-	f.SetUnsupported(42)
+	f.SetUnsupported()
 	if f.IsIgnored() || f.MustRescan() || !f.IsInvalid() {
 		t.Error("file should be invalid")
 	}
@@ -635,7 +702,7 @@ func TestIsEquivalent(t *testing.T) {
 		// Empty FileInfos are equivalent
 		{eq: true},
 
-		// Various basic attributes, all of which cause ineqality when
+		// Various basic attributes, all of which cause inequality when
 		// they differ
 		{
 			a:  FileInfo{Name: "foo"},
@@ -727,16 +794,16 @@ func TestIsEquivalent(t *testing.T) {
 
 		// Difference in permissions is not OK.
 		{
-			a:        FileInfo{Permissions: 0444},
-			b:        FileInfo{Permissions: 0666},
+			a:        FileInfo{Permissions: 0o444},
+			b:        FileInfo{Permissions: 0o666},
 			ignPerms: b(false),
 			eq:       false,
 		},
 
 		// ... unless we say it is
 		{
-			a:        FileInfo{Permissions: 0666},
-			b:        FileInfo{Permissions: 0444},
+			a:        FileInfo{Permissions: 0o666},
+			b:        FileInfo{Permissions: 0o444},
 			ignPerms: b(true),
 			eq:       true,
 		},
@@ -781,12 +848,12 @@ func TestIsEquivalent(t *testing.T) {
 		},
 	}
 
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		// On windows we only check the user writable bit of the permission
 		// set, so these are equivalent.
 		cases = append(cases, testCase{
-			a:        FileInfo{Permissions: 0777},
-			b:        FileInfo{Permissions: 0600},
+			a:        FileInfo{Permissions: 0o777},
+			b:        FileInfo{Permissions: 0o600},
 			ignPerms: b(false),
 			eq:       true,
 		})
@@ -805,10 +872,10 @@ func TestIsEquivalent(t *testing.T) {
 					continue
 				}
 
-				if res := tc.a.isEquivalent(tc.b, 0, ignPerms, ignBlocks, tc.ignFlags); res != tc.eq {
+				if res := tc.a.isEquivalent(tc.b, FileInfoComparison{IgnorePerms: ignPerms, IgnoreBlocks: ignBlocks, IgnoreFlags: tc.ignFlags}); res != tc.eq {
 					t.Errorf("Case %d:\na: %v\nb: %v\na.IsEquivalent(b, %v, %v) => %v, expected %v", i, tc.a, tc.b, ignPerms, ignBlocks, res, tc.eq)
 				}
-				if res := tc.b.isEquivalent(tc.a, 0, ignPerms, ignBlocks, tc.ignFlags); res != tc.eq {
+				if res := tc.b.isEquivalent(tc.a, FileInfoComparison{IgnorePerms: ignPerms, IgnoreBlocks: ignBlocks, IgnoreFlags: tc.ignFlags}); res != tc.eq {
 					t.Errorf("Case %d:\na: %v\nb: %v\nb.IsEquivalent(a, %v, %v) => %v, expected %v", i, tc.a, tc.b, ignPerms, ignBlocks, res, tc.eq)
 				}
 			}
@@ -831,8 +898,10 @@ func TestSha256OfEmptyBlock(t *testing.T) {
 func TestClusterConfigAfterClose(t *testing.T) {
 	m := newTestModel()
 
-	c := NewConnection(c0ID, &testutils.BlockingRW{}, &testutils.BlockingRW{}, m, "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	rw := testutils.NewBlockingRW()
+	c := getRawConnection(NewConnection(c0ID, rw, rw, testutils.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
 	c.Start()
+	defer closeAndWait(c, rw)
 
 	c.internalClose(errManual)
 
@@ -853,11 +922,13 @@ func TestDispatcherToCloseDeadlock(t *testing.T) {
 	// Verify that we don't deadlock when calling Close() from within one of
 	// the model callbacks (ClusterConfig).
 	m := newTestModel()
-	c := NewConnection(c0ID, &testutils.BlockingRW{}, &testutils.NoopRW{}, m, "name", CompressAlways).(wireFormatConnection).Connection.(*rawConnection)
+	rw := testutils.NewBlockingRW()
+	c := getRawConnection(NewConnection(c0ID, rw, &testutils.NoopRW{}, testutils.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, nil, testKeyGen))
 	m.ccFn = func(devID DeviceID, cc ClusterConfig) {
 		c.Close(errManual)
 	}
 	c.Start()
+	defer closeAndWait(c, rw)
 
 	c.inbox <- &ClusterConfig{}
 
@@ -923,4 +994,30 @@ func TestIndexIDString(t *testing.T) {
 	if i.String() != "0x000000000000002A" {
 		t.Error(i.String())
 	}
+}
+
+func closeAndWait(c interface{}, closers ...io.Closer) {
+	for _, closer := range closers {
+		closer.Close()
+	}
+	var raw *rawConnection
+	switch i := c.(type) {
+	case *rawConnection:
+		raw = i
+	default:
+		raw = getRawConnection(c.(Connection))
+	}
+	raw.internalClose(ErrClosed)
+	raw.loopWG.Wait()
+}
+
+func getRawConnection(c Connection) *rawConnection {
+	var raw *rawConnection
+	switch i := c.(type) {
+	case wireFormatConnection:
+		raw = i.Connection.(encryptedConnection).conn
+	case encryptedConnection:
+		raw = i.conn
+	}
+	return raw
 }

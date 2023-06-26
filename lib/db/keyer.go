@@ -36,7 +36,7 @@ const (
 	// KeyTypeFolderStatistic <folder ID as string> <some string> = some value
 	KeyTypeFolderStatistic byte = 4
 
-	// KeyTypeVirtualMtime <int32 folder ID> <file name> = dbMtime
+	// KeyTypeVirtualMtime <int32 folder ID> <file name> = mtimeMapping
 	KeyTypeVirtualMtime byte = 5
 
 	// KeyTypeFolderIdx <int32 id> = string value
@@ -68,6 +68,12 @@ const (
 
 	// KeyTypeVersion <version hash> = Vector
 	KeyTypeVersion byte = 15
+
+	// KeyTypePendingFolder <int32 device ID> <folder ID as string> = ObservedFolder
+	KeyTypePendingFolder byte = 16
+
+	// KeyTypePendingDevice <device ID in wire format> = ObservedDevice
+	KeyTypePendingDevice byte = 17
 )
 
 type keyer interface {
@@ -96,6 +102,7 @@ type keyer interface {
 
 	// index IDs
 	GenerateIndexIDKey(key, device, folder []byte) (indexIDKey, error)
+	FolderFromIndexIDKey(key []byte) ([]byte, bool)
 
 	// Mtimes
 	GenerateMtimesKey(key, folder []byte) (mtimesKey, error)
@@ -108,6 +115,14 @@ type keyer interface {
 
 	// Version vectors
 	GenerateVersionKey(key []byte, hash []byte) versionKey
+
+	// Pending (unshared) folders and devices
+	GeneratePendingFolderKey(key, device, folder []byte) (pendingFolderKey, error)
+	FolderFromPendingFolderKey(key []byte) []byte
+	DeviceFromPendingFolderKey(key []byte) ([]byte, bool)
+
+	GeneratePendingDeviceKey(key, device []byte) pendingDeviceKey
+	DeviceFromPendingDeviceKey(key []byte) []byte
 }
 
 // defaultKeyer implements our key scheme. It needs folder and device
@@ -151,7 +166,7 @@ func (k defaultKeyer) GenerateDeviceFileKey(key, folder, device, name []byte) (d
 	return key, nil
 }
 
-func (k defaultKeyer) NameFromDeviceFileKey(key []byte) []byte {
+func (defaultKeyer) NameFromDeviceFileKey(key []byte) []byte {
 	return key[keyPrefixLen+keyFolderLen+keyDeviceLen:]
 }
 
@@ -181,7 +196,7 @@ func (k defaultKeyer) GenerateGlobalVersionKey(key, folder, name []byte) (global
 	return key, nil
 }
 
-func (k defaultKeyer) NameFromGlobalVersionKey(key []byte) []byte {
+func (defaultKeyer) NameFromGlobalVersionKey(key []byte) []byte {
 	return key[keyPrefixLen+keyFolderLen:]
 }
 
@@ -200,7 +215,7 @@ func (k defaultKeyer) GenerateBlockMapKey(key, folder, hash, name []byte) (block
 	return key, nil
 }
 
-func (k defaultKeyer) NameFromBlockMapKey(key []byte) []byte {
+func (defaultKeyer) NameFromBlockMapKey(key []byte) []byte {
 	return key[keyPrefixLen+keyFolderLen+keyHashLen:]
 }
 
@@ -223,7 +238,7 @@ func (k defaultKeyer) GenerateBlockListMapKey(key, folder, hash, name []byte) (b
 	return key, nil
 }
 
-func (k defaultKeyer) NameFromBlockListMapKey(key []byte) []byte {
+func (defaultKeyer) NameFromBlockListMapKey(key []byte) []byte {
 	return key[keyPrefixLen+keyFolderLen+keyHashLen:]
 }
 
@@ -267,7 +282,7 @@ func (k defaultKeyer) GenerateSequenceKey(key, folder []byte, seq int64) (sequen
 	return key, nil
 }
 
-func (k defaultKeyer) SequenceFromSequenceKey(key []byte) int64 {
+func (defaultKeyer) SequenceFromSequenceKey(key []byte) int64 {
 	return int64(binary.BigEndian.Uint64(key[keyPrefixLen+keyFolderLen:]))
 }
 
@@ -287,6 +302,10 @@ func (k defaultKeyer) GenerateIndexIDKey(key, device, folder []byte) (indexIDKey
 	binary.BigEndian.PutUint32(key[keyPrefixLen:], deviceID)
 	binary.BigEndian.PutUint32(key[keyPrefixLen+keyDeviceLen:], folderID)
 	return key, nil
+}
+
+func (k defaultKeyer) FolderFromIndexIDKey(key []byte) ([]byte, bool) {
+	return k.folderIdx.Val(binary.BigEndian.Uint32(key[keyPrefixLen+keyDeviceLen:]))
 }
 
 type mtimesKey []byte
@@ -317,7 +336,7 @@ func (k defaultKeyer) GenerateFolderMetaKey(key, folder []byte) (folderMetaKey, 
 
 type blockListKey []byte
 
-func (k defaultKeyer) GenerateBlockListKey(key []byte, hash []byte) blockListKey {
+func (defaultKeyer) GenerateBlockListKey(key []byte, hash []byte) blockListKey {
 	key = resize(key, keyPrefixLen+len(hash))
 	key[0] = KeyTypeBlockList
 	copy(key[keyPrefixLen:], hash)
@@ -330,7 +349,7 @@ func (k blockListKey) Hash() []byte {
 
 type versionKey []byte
 
-func (k defaultKeyer) GenerateVersionKey(key []byte, hash []byte) versionKey {
+func (defaultKeyer) GenerateVersionKey(key []byte, hash []byte) versionKey {
 	key = resize(key, keyPrefixLen+len(hash))
 	key[0] = KeyTypeVersion
 	copy(key[keyPrefixLen:], hash)
@@ -339,6 +358,41 @@ func (k defaultKeyer) GenerateVersionKey(key []byte, hash []byte) versionKey {
 
 func (k versionKey) Hash() []byte {
 	return k[keyPrefixLen:]
+}
+
+type pendingFolderKey []byte
+
+func (k defaultKeyer) GeneratePendingFolderKey(key, device, folder []byte) (pendingFolderKey, error) {
+	deviceID, err := k.deviceIdx.ID(device)
+	if err != nil {
+		return nil, err
+	}
+	key = resize(key, keyPrefixLen+keyDeviceLen+len(folder))
+	key[0] = KeyTypePendingFolder
+	binary.BigEndian.PutUint32(key[keyPrefixLen:], deviceID)
+	copy(key[keyPrefixLen+keyDeviceLen:], folder)
+	return key, nil
+}
+
+func (defaultKeyer) FolderFromPendingFolderKey(key []byte) []byte {
+	return key[keyPrefixLen+keyDeviceLen:]
+}
+
+func (k defaultKeyer) DeviceFromPendingFolderKey(key []byte) ([]byte, bool) {
+	return k.deviceIdx.Val(binary.BigEndian.Uint32(key[keyPrefixLen:]))
+}
+
+type pendingDeviceKey []byte
+
+func (defaultKeyer) GeneratePendingDeviceKey(key, device []byte) pendingDeviceKey {
+	key = resize(key, keyPrefixLen+len(device))
+	key[0] = KeyTypePendingDevice
+	copy(key[keyPrefixLen:], device)
+	return key
+}
+
+func (defaultKeyer) DeviceFromPendingDeviceKey(key []byte) []byte {
+	return key[keyPrefixLen:]
 }
 
 // resize returns a byte slice of the specified size, reusing bs if possible

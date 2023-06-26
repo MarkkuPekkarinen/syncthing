@@ -7,7 +7,6 @@
 package nat
 
 import (
-	"io/ioutil"
 	"net"
 	"os"
 	"testing"
@@ -60,11 +59,11 @@ func TestMappingValidGateway(t *testing.T) {
 }
 
 func TestMappingClearAddresses(t *testing.T) {
-	tmpFile, err := ioutil.TempFile("", "syncthing-testConfig-")
+	tmpFile, err := os.CreateTemp("", "syncthing-testConfig-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := config.Wrap(tmpFile.Name(), config.Configuration{}, events.NoopLogger)
+	w := config.Wrap(tmpFile.Name(), config.Configuration{}, protocol.LocalDeviceID, events.NoopLogger)
 	defer os.RemoveAll(tmpFile.Name())
 	tmpFile.Close()
 

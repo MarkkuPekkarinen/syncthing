@@ -16,34 +16,14 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/nat"
+	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/stats"
+
+	"github.com/thejerf/suture/v4"
 )
-
-// Connection is what we expose to the outside. It is a protocol.Connection
-// that can be closed and has some metadata.
-type Connection interface {
-	protocol.Connection
-	Type() string
-	Transport() string
-	RemoteAddr() net.Addr
-	Priority() int
-	String() string
-	Crypto() string
-}
-
-// completeConn is the aggregation of an internalConn and the
-// protocol.Connection running on top of it. It implements the Connection
-// interface.
-type completeConn struct {
-	internalConn
-	protocol.Connection
-}
-
-func (c completeConn) Close(err error) {
-	c.Connection.Close(err)
-	c.internalConn.Close()
-}
 
 type tlsConn interface {
 	io.ReadWriteCloser
@@ -58,8 +38,10 @@ type tlsConn interface {
 // came from (type, priority).
 type internalConn struct {
 	tlsConn
-	connType connType
-	priority int
+	connType      connType
+	isLocal       bool
+	priority      int
+	establishedAt time.Time
 }
 
 type connType int
@@ -105,16 +87,30 @@ func (t connType) Transport() string {
 	}
 }
 
-func (c internalConn) Close() {
+func newInternalConn(tc tlsConn, connType connType, isLocal bool, priority int) internalConn {
+	return internalConn{
+		tlsConn:       tc,
+		connType:      connType,
+		isLocal:       isLocal,
+		priority:      priority,
+		establishedAt: time.Now().Truncate(time.Second),
+	}
+}
+
+func (c internalConn) Close() error {
 	// *tls.Conn.Close() does more than it says on the tin. Specifically, it
 	// sends a TLS alert message, which might block forever if the
 	// connection is dead and we don't have a deadline set.
 	_ = c.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
-	_ = c.tlsConn.Close()
+	return c.tlsConn.Close()
 }
 
 func (c internalConn) Type() string {
 	return c.connType.String()
+}
+
+func (c internalConn) IsLocal() bool {
+	return c.isLocal
 }
 
 func (c internalConn) Priority() int {
@@ -128,12 +124,8 @@ func (c internalConn) Crypto() string {
 
 func (c internalConn) Transport() string {
 	transport := c.connType.Transport()
-	host, _, err := net.SplitHostPort(c.LocalAddr().String())
+	ip, err := osutil.IPFromAddr(c.LocalAddr())
 	if err != nil {
-		return transport
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
 		return transport
 	}
 	if ip.To4() != nil {
@@ -142,13 +134,20 @@ func (c internalConn) Transport() string {
 	return transport + "6"
 }
 
+func (c internalConn) EstablishedAt() time.Time {
+	return c.establishedAt
+}
+
 func (c internalConn) String() string {
-	return fmt.Sprintf("%s-%s/%s/%s", c.LocalAddr(), c.RemoteAddr(), c.Type(), c.Crypto())
+	t := "WAN"
+	if c.isLocal {
+		t = "LAN"
+	}
+	return fmt.Sprintf("%s-%s/%s/%s/%s-P%d", c.LocalAddr(), c.RemoteAddr(), c.Type(), c.Crypto(), t, c.Priority())
 }
 
 type dialerFactory interface {
-	New(config.OptionsConfiguration, *tls.Config) genericDialer
-	Priority() int
+	New(config.OptionsConfiguration, *tls.Config, *registry.Registry, *lanChecker) genericDialer
 	AlwaysWAN() bool
 	Valid(config.Configuration) error
 	String() string
@@ -158,19 +157,30 @@ type commonDialer struct {
 	trafficClass      int
 	reconnectInterval time.Duration
 	tlsCfg            *tls.Config
+	lanChecker        *lanChecker
+	lanPriority       int
+	wanPriority       int
 }
 
 func (d *commonDialer) RedialFrequency() time.Duration {
 	return d.reconnectInterval
 }
 
+func (d *commonDialer) Priority(host string) int {
+	if d.lanChecker.isLANHost(host) {
+		return d.lanPriority
+	}
+	return d.wanPriority
+}
+
 type genericDialer interface {
 	Dial(context.Context, protocol.DeviceID, *url.URL) (internalConn, error)
 	RedialFrequency() time.Duration
+	Priority(host string) int
 }
 
 type listenerFactory interface {
-	New(*url.URL, config.Wrapper, *tls.Config, chan internalConn, *nat.Service) genericListener
+	New(*url.URL, config.Wrapper, *tls.Config, chan internalConn, *nat.Service, *registry.Registry, *lanChecker) genericListener
 	Valid(config.Configuration) error
 }
 
@@ -181,8 +191,7 @@ type ListenerAddresses struct {
 }
 
 type genericListener interface {
-	Serve()
-	Stop()
+	suture.Service
 	URI() *url.URL
 	// A given address can potentially be mutated by the listener.
 	// For example we bind to tcp://0.0.0.0, but that for example might return
@@ -202,10 +211,12 @@ type genericListener interface {
 
 type Model interface {
 	protocol.Model
-	AddConnection(conn Connection, hello protocol.HelloResult)
-	Connection(remoteID protocol.DeviceID) (Connection, bool)
-	OnHello(protocol.DeviceID, net.Addr, protocol.HelloResult) error
+	AddConnection(conn protocol.Connection, hello protocol.Hello)
+	NumConnections() int
+	Connection(remoteID protocol.DeviceID) (protocol.Connection, bool)
+	OnHello(protocol.DeviceID, net.Addr, protocol.Hello) error
 	GetHello(protocol.DeviceID) protocol.HelloIntf
+	DeviceStatistics() (map[protocol.DeviceID]stats.DeviceStatistics, error)
 }
 
 type onAddressesChangedNotifier struct {

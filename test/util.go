@@ -4,17 +4,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build integration
 // +build integration
 
 package integration
 
 import (
-	"crypto/md5"
 	cr "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
@@ -26,7 +25,9 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/rc"
+	"github.com/syncthing/syncthing/lib/sha256"
 )
 
 func init() {
@@ -82,7 +83,7 @@ func generateFilesWithTime(dir string, files, maxexp int, srcname string, t0 tim
 }
 
 func generateOneFile(fd io.ReadSeeker, p1 string, s int64, t0 time.Time) error {
-	src := io.LimitReader(&inifiteReader{fd}, int64(s))
+	src := io.LimitReader(&infiniteReader{fd}, int64(s))
 	dst, err := os.Create(p1)
 	if err != nil {
 		return err
@@ -174,7 +175,7 @@ func alterFiles(dir string) error {
 
 		// Change capitalization
 		case r == 2 && comps > 3 && rand.Float64() < 0.2:
-			if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+			if build.IsDarwin || build.IsWindows {
 				// Syncthing is currently broken for case-only renames on case-
 				// insensitive platforms.
 				// https://github.com/syncthing/syncthing/issues/1787
@@ -205,7 +206,7 @@ func alterFiles(dir string) error {
 							return err
 						}
 						d1 := []byte("I used to be a dir: " + path)
-						err := ioutil.WriteFile(path, d1, 0644)
+						err := os.WriteFile(path, d1, 0644)
 						if err != nil {
 							return err
 						}
@@ -264,11 +265,11 @@ func randomName() string {
 	return fmt.Sprintf("%x", b[:])
 }
 
-type inifiteReader struct {
+type infiniteReader struct {
 	rd io.ReadSeeker
 }
 
-func (i *inifiteReader) Read(bs []byte) (int, error) {
+func (i *infiniteReader) Read(bs []byte) (int, error) {
 	n, err := i.rd.Read(bs)
 	if err == io.EOF {
 		err = nil
@@ -395,7 +396,7 @@ type fileInfo struct {
 	name string
 	mode os.FileMode
 	mod  int64
-	hash [16]byte
+	hash [sha256.Size]byte
 	size int64
 }
 
@@ -442,11 +443,7 @@ func startWalker(dir string, res chan<- fileInfo, abort <-chan struct{}) chan er
 			if err != nil {
 				return err
 			}
-			h := md5.New()
-			h.Write([]byte(tgt))
-			hash := h.Sum(nil)
-
-			copy(f.hash[:], hash)
+			f.hash = sha256.Sum256([]byte(tgt))
 		} else if info.IsDir() {
 			f = fileInfo{
 				name: rn,
@@ -463,7 +460,7 @@ func startWalker(dir string, res chan<- fileInfo, abort <-chan struct{}) chan er
 				mod:  info.ModTime().Unix(),
 				size: info.Size(),
 			}
-			sum, err := md5file(path)
+			sum, err := sha256file(path)
 			if err != nil {
 				return err
 			}
@@ -490,14 +487,14 @@ func startWalker(dir string, res chan<- fileInfo, abort <-chan struct{}) chan er
 	return errc
 }
 
-func md5file(fname string) (hash [16]byte, err error) {
+func sha256file(fname string) (hash [sha256.Size]byte, err error) {
 	f, err := os.Open(fname)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
-	h := md5.New()
+	h := sha256.New()
 	io.Copy(h, f)
 	hb := h.Sum(nil)
 	copy(hash[:], hb)
@@ -545,7 +542,7 @@ func startInstance(t *testing.T, i int) *rc.Process {
 
 	p := rc.NewProcess(addr)
 	p.LogTo(log)
-	if err := p.Start("../bin/syncthing", "-home", fmt.Sprintf("h%d", i), "-no-browser"); err != nil {
+	if err := p.Start("../bin/syncthing", "--home", fmt.Sprintf("h%d", i), "--no-browser"); err != nil {
 		t.Fatal(err)
 	}
 	p.AwaitStartup()
@@ -554,11 +551,27 @@ func startInstance(t *testing.T, i int) *rc.Process {
 }
 
 func symlinksSupported() bool {
-	tmp, err := ioutil.TempDir("", "symlink-test")
+	tmp, err := os.MkdirTemp("", "symlink-test")
 	if err != nil {
 		return false
 	}
 	defer os.RemoveAll(tmp)
 	err = os.Symlink("tmp", filepath.Join(tmp, "link"))
 	return err == nil
+}
+
+// checkRemoteInSync checks if the devices associated twith the given processes
+// are in sync according to the remote status on both sides.
+func checkRemoteInSync(folder string, p1, p2 *rc.Process) error {
+	if inSync, err := p1.RemoteInSync(folder, p2.ID()); err != nil {
+		return err
+	} else if !inSync {
+		return fmt.Errorf(`from device %v folder "%v" is not in sync on device %v`, p1.ID(), folder, p2.ID())
+	}
+	if inSync, err := p2.RemoteInSync(folder, p1.ID()); err != nil {
+		return err
+	} else if !inSync {
+		return fmt.Errorf(`from device %v folder "%v" is not in sync on device %v`, p2.ID(), folder, p1.ID())
+	}
+	return nil
 }

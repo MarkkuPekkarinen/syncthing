@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/dialer"
+	"github.com/syncthing/syncthing/lib/osutil"
 	syncthingprotocol "github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay/protocol"
 )
@@ -66,7 +67,7 @@ func GetInvitationFromRelay(ctx context.Context, uri *url.URL, id syncthingproto
 		l.Debugln("Received invitation", msg, "via", conn.LocalAddr())
 		ip := net.IP(msg.Address)
 		if len(ip) == 0 || ip.IsUnspecified() {
-			msg.Address = remoteIPBytes(conn)
+			msg.Address, _ = osutil.IPFromAddr(conn.RemoteAddr())
 		}
 		return msg, nil
 	default:
@@ -114,17 +115,22 @@ func JoinSession(ctx context.Context, invitation protocol.SessionInvitation) (ne
 
 func TestRelay(ctx context.Context, uri *url.URL, certs []tls.Certificate, sleep, timeout time.Duration, times int) error {
 	id := syncthingprotocol.NewDeviceID(certs[0].Certificate[0])
-	invs := make(chan protocol.SessionInvitation, 1)
-	c, err := NewClient(uri, certs, invs, timeout)
+	c, err := NewClient(uri, certs, timeout)
 	if err != nil {
-		close(invs)
 		return fmt.Errorf("creating client: %w", err)
 	}
-	go c.Serve()
-	defer func() {
-		c.Stop()
-		close(invs)
+	ctx, cancel := context.WithCancel(context.Background())
+	go c.Serve(ctx)
+	go func() {
+		for {
+			select {
+			case <-c.Invitations():
+			case <-ctx.Done():
+				return
+			}
+		}
 	}()
+	defer cancel()
 
 	for i := 0; i < times; i++ {
 		_, err = GetInvitationFromRelay(ctx, uri, id, certs, timeout)
@@ -157,12 +163,4 @@ func configForCerts(certs []tls.Certificate) *tls.Config {
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
 		},
 	}
-}
-
-func remoteIPBytes(conn net.Conn) []byte {
-	addr := conn.RemoteAddr().String()
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		addr = host
-	}
-	return net.ParseIP(addr)[:]
 }

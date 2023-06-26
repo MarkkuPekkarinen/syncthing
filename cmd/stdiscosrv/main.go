@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"log"
@@ -21,7 +22,7 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/thejerf/suture"
+	"github.com/thejerf/suture/v4"
 )
 
 const (
@@ -115,8 +116,11 @@ func main() {
 	var replicationDestinations []string
 	parts := strings.Split(replicationPeers, ",")
 	for _, part := range parts {
-		fields := strings.Split(part, "@")
+		if part == "" {
+			continue
+		}
 
+		fields := strings.Split(part, "@")
 		switch len(fields) {
 		case 2:
 			// This is an id@address specification. Grab the address for the
@@ -135,6 +139,9 @@ func main() {
 			id, err := protocol.DeviceIDFromString(fields[0])
 			if err != nil {
 				log.Fatalln("Parsing device ID:", err)
+			}
+			if id == protocol.EmptyDeviceID {
+				log.Fatalf("Missing device ID for peer in %q", part)
 			}
 			allowedReplicationPeers = append(allowedReplicationPeers, id)
 
@@ -183,5 +190,5 @@ func main() {
 	}
 
 	// Engage!
-	main.Serve()
+	main.Serve(context.Background())
 }

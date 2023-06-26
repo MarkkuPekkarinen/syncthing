@@ -4,6 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
+//go:build (!solaris && !darwin) || (solaris && cgo) || (darwin && cgo)
 // +build !solaris,!darwin solaris,cgo darwin,cgo
 
 package fs
@@ -14,7 +15,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/syncthing/notify"
+	"github.com/syncthing/syncthing/lib/build"
 )
 
 func TestMain(m *testing.M) {
@@ -40,7 +41,7 @@ func TestMain(m *testing.M) {
 	}
 
 	testDirAbs = filepath.Join(dir, testDir)
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		testDirAbs = longFilenameSupport(testDirAbs)
 	}
 
@@ -67,7 +68,7 @@ var (
 )
 
 func TestWatchIgnore(t *testing.T) {
-	if runtime.GOOS == "openbsd" {
+	if build.IsOpenBSD {
 		t.Skip(failsOnOpenBSD)
 	}
 	name := "ignore"
@@ -87,11 +88,11 @@ func TestWatchIgnore(t *testing.T) {
 		{name, NonRemove},
 	}
 
-	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{ignore: filepath.Join(name, ignored), skipIgnoredDirs: true})
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{ignore: filepath.Join(name, ignored), skipIgnoredDirs: true}, false)
 }
 
 func TestWatchInclude(t *testing.T) {
-	if runtime.GOOS == "openbsd" {
+	if build.IsOpenBSD {
 		t.Skip(failsOnOpenBSD)
 	}
 	name := "include"
@@ -114,11 +115,11 @@ func TestWatchInclude(t *testing.T) {
 		{name, NonRemove},
 	}
 
-	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{ignore: filepath.Join(name, ignored), include: filepath.Join(name, included)})
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{ignore: filepath.Join(name, ignored), include: filepath.Join(name, included)}, false)
 }
 
 func TestWatchRename(t *testing.T) {
-	if runtime.GOOS == "openbsd" {
+	if build.IsOpenBSD {
 		t.Skip(failsOnOpenBSD)
 	}
 	name := "rename"
@@ -133,7 +134,7 @@ func TestWatchRename(t *testing.T) {
 	destEvent := Event{new, Remove}
 	// Only on these platforms the removed file can be differentiated from
 	// the created file during renaming
-	if runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "solaris" || runtime.GOOS == "freebsd" {
+	if build.IsWindows || build.IsLinux || build.IsSolaris || build.IsIllumos || build.IsFreeBSD {
 		destEvent = Event{new, NonRemove}
 	}
 	expectedEvents := []Event{
@@ -146,14 +147,14 @@ func TestWatchRename(t *testing.T) {
 
 	// set the "allow others" flag because we might get the create of
 	// "oldfile" initially
-	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{})
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{}, false)
 }
 
 // TestWatchWinRoot checks that a watch at a drive letter does not panic due to
 // out of root event on every event.
 // https://github.com/syncthing/syncthing/issues/5695
 func TestWatchWinRoot(t *testing.T) {
-	if runtime.GOOS != "windows" {
+	if !build.IsWindows {
 		t.Skip("Windows specific test")
 	}
 
@@ -287,7 +288,7 @@ func TestWatchSubpath(t *testing.T) {
 
 // TestWatchOverflow checks that an event at the root is sent when maxFiles is reached
 func TestWatchOverflow(t *testing.T) {
-	if runtime.GOOS == "openbsd" {
+	if build.IsOpenBSD {
 		t.Skip(failsOnOpenBSD)
 	}
 	name := "overflow"
@@ -308,11 +309,11 @@ func TestWatchOverflow(t *testing.T) {
 		}
 	}
 
-	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{})
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{}, false)
 }
 
 func TestWatchErrorLinuxInterpretation(t *testing.T) {
-	if runtime.GOOS != "linux" {
+	if !build.IsLinux {
 		t.Skip("testing of linux specific error codes")
 	}
 
@@ -340,7 +341,7 @@ func TestWatchErrorLinuxInterpretation(t *testing.T) {
 }
 
 func TestWatchSymlinkedRoot(t *testing.T) {
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		t.Skip("Involves symlinks")
 	}
 
@@ -384,7 +385,7 @@ func TestUnrootedChecked(t *testing.T) {
 }
 
 func TestWatchIssue4877(t *testing.T) {
-	if runtime.GOOS != "windows" {
+	if !build.IsWindows {
 		t.Skip("Windows specific test")
 	}
 
@@ -413,7 +414,94 @@ func TestWatchIssue4877(t *testing.T) {
 		testFs = origTestFs
 	}()
 
-	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{})
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{}, false)
+}
+
+func TestWatchModTime(t *testing.T) {
+	name := "modtime"
+
+	file := createTestFile(name, "foo")
+	path := filepath.Join(name, file)
+	now := time.Now()
+	before := now.Add(-10 * time.Second)
+	if err := testFs.Chtimes(path, before, before); err != nil {
+		t.Fatal(err)
+	}
+
+	testCase := func() {
+		if err := testFs.Chtimes(path, now, now); err != nil {
+			t.Error(err)
+		}
+	}
+
+	expectedEvents := []Event{
+		{file, NonRemove},
+	}
+
+	var allowedEvents []Event
+	// Apparently an event for the parent is also sent on mac
+	if build.IsDarwin {
+		allowedEvents = []Event{
+			{name, NonRemove},
+		}
+	}
+
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{}, false)
+}
+
+func TestModifyFile(t *testing.T) {
+	name := "modify"
+
+	old := createTestFile(name, "file")
+	modifyTestFile(name, old, "syncthing")
+
+	testCase := func() {
+		modifyTestFile(name, old, "modified")
+	}
+
+	expectedEvents := []Event{
+		{old, NonRemove},
+	}
+	allowedEvents := []Event{
+		{name, NonRemove},
+	}
+
+	sleepMs(1000)
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{}, false)
+}
+
+func TestTruncateFileOnly(t *testing.T) {
+	name := "truncate"
+
+	file := createTestFile(name, "file")
+	modifyTestFile(name, file, "syncthing")
+
+	// modified the content to empty use os.WriteFile will first truncate the file
+	// (/os/file.go:696) then write nothing. This logic is also used in many editors,
+	// such as when emptying a file in VSCode or JetBrain
+	//
+	// darwin will only modified the inode's metadata, such us mtime, file size, etc.
+	// but would not modified the file directly, so FSEvent 'FSEventsModified' will not
+	// be received
+	//
+	// we should watch the FSEvent 'FSEventsInodeMetaMod' to watch the Inode metadata,
+	// and that should be considered as an NonRemove Event
+	//
+	// notify also considered FSEventsInodeMetaMod as Write Event
+	// /watcher_fsevents.go:89
+	testCase := func() {
+		modifyTestFile(name, file, "")
+	}
+
+	expectedEvents := []Event{
+		{file, NonRemove},
+	}
+	allowedEvents := []Event{
+		{file, NonRemove},
+	}
+
+	sleepMs(1000)
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{}, true)
 }
 
 // path relative to folder root, also creates parent dirs if necessary
@@ -438,11 +526,20 @@ func renameTestFile(name string, old string, new string) {
 	}
 }
 
+func modifyTestFile(name string, file string, content string) {
+	joined := filepath.Join(testDirAbs, name, file)
+
+	err := os.WriteFile(joined, []byte(content), 0755)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to modify test file %s: %s", joined, err))
+	}
+}
+
 func sleepMs(ms int) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
 
-func testScenario(t *testing.T, name string, testCase func(), expectedEvents, allowedEvents []Event, fm fakeMatcher) {
+func testScenario(t *testing.T, name string, testCase func(), expectedEvents, allowedEvents []Event, fm fakeMatcher, ignorePerms bool) {
 	if err := testFs.MkdirAll(name, 0755); err != nil {
 		panic(fmt.Sprintf("Failed to create directory %s: %s", name, err))
 	}
@@ -451,7 +548,7 @@ func testScenario(t *testing.T, name string, testCase func(), expectedEvents, al
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	eventChan, errChan, err := testFs.Watch(name, fm, ctx, false)
+	eventChan, errChan, err := testFs.Watch(name, fm, ctx, ignorePerms)
 	if err != nil {
 		panic(err)
 	}
@@ -530,10 +627,10 @@ func (e fakeEventInfo) Path() string {
 	return string(e)
 }
 
-func (e fakeEventInfo) Event() notify.Event {
+func (fakeEventInfo) Event() notify.Event {
 	return notify.Write
 }
 
-func (e fakeEventInfo) Sys() interface{} {
+func (fakeEventInfo) Sys() interface{} {
 	return nil
 }

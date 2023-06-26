@@ -18,7 +18,7 @@ import (
 	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/nat"
-	"github.com/syncthing/syncthing/lib/util"
+	"github.com/syncthing/syncthing/lib/svcutil"
 )
 
 func init() {
@@ -29,17 +29,20 @@ func init() {
 }
 
 type tcpListener struct {
-	util.ServiceWithError
+	svcutil.ServiceWithError
 	onAddressesChangedNotifier
 
-	uri     *url.URL
-	cfg     config.Wrapper
-	tlsCfg  *tls.Config
-	conns   chan internalConn
-	factory listenerFactory
+	uri        *url.URL
+	cfg        config.Wrapper
+	tlsCfg     *tls.Config
+	conns      chan internalConn
+	factory    listenerFactory
+	registry   *registry.Registry
+	lanChecker *lanChecker
 
 	natService *nat.Service
 	mapping    *nat.Mapping
+	laddr      net.Addr
 
 	mut sync.RWMutex
 }
@@ -60,25 +63,37 @@ func (t *tcpListener) serve(ctx context.Context) error {
 		l.Infoln("Listen (BEP/tcp):", err)
 		return err
 	}
-	t.notifyAddressesChanged(t)
-	registry.Register(t.uri.Scheme, tcaddr)
-
 	defer listener.Close()
-	defer t.clearAddresses(t)
-	defer registry.Unregister(t.uri.Scheme, tcaddr)
 
-	l.Infof("TCP listener (%v) starting", listener.Addr())
-	defer l.Infof("TCP listener (%v) shutting down", listener.Addr())
+	// We might bind to :0, so use the port we've been given.
+	tcaddr = listener.Addr().(*net.TCPAddr)
+
+	t.notifyAddressesChanged(t)
+	defer t.clearAddresses(t)
+
+	t.registry.Register(t.uri.Scheme, tcaddr)
+	defer t.registry.Unregister(t.uri.Scheme, tcaddr)
+
+	l.Infof("TCP listener (%v) starting", tcaddr)
+	defer l.Infof("TCP listener (%v) shutting down", tcaddr)
 
 	mapping := t.natService.NewMapping(nat.TCP, tcaddr.IP, tcaddr.Port)
-	mapping.OnChanged(func(_ *nat.Mapping, _, _ []nat.Address) {
+	mapping.OnChanged(func() {
 		t.notifyAddressesChanged(t)
 	})
+	// Should be called after t.mapping is nil'ed out.
 	defer t.natService.RemoveMapping(mapping)
 
 	t.mut.Lock()
 	t.mapping = mapping
+	t.laddr = tcaddr
 	t.mut.Unlock()
+	defer func() {
+		t.mut.Lock()
+		t.mapping = nil
+		t.laddr = nil
+		t.mut.Unlock()
+	}()
 
 	acceptFailures := 0
 	const maxAcceptFailures = 10
@@ -94,9 +109,6 @@ func (t *tcpListener) serve(ctx context.Context) error {
 			if err == nil {
 				conn.Close()
 			}
-			t.mut.Lock()
-			t.mapping = nil
-			t.mut.Unlock()
 			return nil
 		default:
 		}
@@ -137,7 +149,12 @@ func (t *tcpListener) serve(ctx context.Context) error {
 			continue
 		}
 
-		t.conns <- internalConn{tc, connTypeTCPServer, tcpPriority}
+		priority := t.cfg.Options().ConnectionPriorityTCPWAN
+		isLocal := t.lanChecker.isLAN(conn.RemoteAddr())
+		if isLocal {
+			priority = t.cfg.Options().ConnectionPriorityTCPLAN
+		}
+		t.conns <- newInternalConn(tc, connTypeTCPServer, isLocal, priority)
 	}
 }
 
@@ -146,8 +163,10 @@ func (t *tcpListener) URI() *url.URL {
 }
 
 func (t *tcpListener) WANAddresses() []*url.URL {
-	uris := t.LANAddresses()
 	t.mut.RLock()
+	uris := []*url.URL{
+		maybeReplacePort(t.uri, t.laddr),
+	}
 	if t.mapping != nil {
 		addrs := t.mapping.ExternalAddresses()
 		for _, addr := range addrs {
@@ -179,8 +198,11 @@ func (t *tcpListener) WANAddresses() []*url.URL {
 }
 
 func (t *tcpListener) LANAddresses() []*url.URL {
-	addrs := []*url.URL{t.uri}
-	addrs = append(addrs, getURLsForAllAdaptersIfUnspecified(t.uri.Scheme, t.uri)...)
+	t.mut.RLock()
+	uri := maybeReplacePort(t.uri, t.laddr)
+	t.mut.RUnlock()
+	addrs := []*url.URL{uri}
+	addrs = append(addrs, getURLsForAllAdaptersIfUnspecified(uri.Scheme, uri)...)
 	return addrs
 }
 
@@ -198,7 +220,7 @@ func (t *tcpListener) NATType() string {
 
 type tcpListenerFactory struct{}
 
-func (f *tcpListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service) genericListener {
+func (f *tcpListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service, registry *registry.Registry, lanChecker *lanChecker) genericListener {
 	l := &tcpListener{
 		uri:        fixupPort(uri, config.DefaultTCPPort),
 		cfg:        cfg,
@@ -206,8 +228,10 @@ func (f *tcpListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.C
 		conns:      conns,
 		natService: natService,
 		factory:    f,
+		registry:   registry,
+		lanChecker: lanChecker,
 	}
-	l.ServiceWithError = util.AsServiceWithError(l.serve, l.String())
+	l.ServiceWithError = svcutil.AsService(l.serve, l.String())
 	return l
 }
 

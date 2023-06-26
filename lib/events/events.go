@@ -4,6 +4,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:generate -command counterfeiter go run github.com/maxbrunsfeld/counterfeiter/v6
+//go:generate counterfeiter -o mocks/buffered_subscription.go --fake-name BufferedSubscription . BufferedSubscription
+
 // Package events provides event subscription and polling functionality.
 package events
 
@@ -15,13 +18,12 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/thejerf/suture"
+	"github.com/thejerf/suture/v4"
 
 	"github.com/syncthing/syncthing/lib/sync"
-	"github.com/syncthing/syncthing/lib/util"
 )
 
-type EventType int
+type EventType int64
 
 const (
 	Starting EventType = 1 << iota
@@ -29,9 +31,11 @@ const (
 	DeviceDiscovered
 	DeviceConnected
 	DeviceDisconnected
-	DeviceRejected
+	DeviceRejected // DEPRECATED, superseded by PendingDevicesChanged
+	PendingDevicesChanged
 	DevicePaused
 	DeviceResumed
+	ClusterConfigReceived
 	LocalChangeDetected
 	RemoteChangeDetected
 	LocalIndexUpdated
@@ -39,7 +43,8 @@ const (
 	ItemStarted
 	ItemFinished
 	StateChanged
-	FolderRejected
+	FolderRejected // DEPRECATED, superseded by PendingFoldersChanged
+	PendingFoldersChanged
 	ConfigSaved
 	DownloadProgress
 	RemoteDownloadProgress
@@ -52,6 +57,7 @@ const (
 	FolderWatchStateChanged
 	ListenAddressesChanged
 	LoginAttempt
+	Failure
 
 	AllEvents = (1 << iota) - 1
 )
@@ -77,6 +83,8 @@ func (t EventType) String() string {
 		return "DeviceDisconnected"
 	case DeviceRejected:
 		return "DeviceRejected"
+	case PendingDevicesChanged:
+		return "PendingDevicesChanged"
 	case LocalChangeDetected:
 		return "LocalChangeDetected"
 	case RemoteChangeDetected:
@@ -93,6 +101,8 @@ func (t EventType) String() string {
 		return "StateChanged"
 	case FolderRejected:
 		return "FolderRejected"
+	case PendingFoldersChanged:
+		return "PendingFoldersChanged"
 	case ConfigSaved:
 		return "ConfigSaved"
 	case DownloadProgress:
@@ -109,6 +119,8 @@ func (t EventType) String() string {
 		return "DevicePaused"
 	case DeviceResumed:
 		return "DeviceResumed"
+	case ClusterConfigReceived:
+		return "ClusterConfigReceived"
 	case FolderScanProgress:
 		return "FolderScanProgress"
 	case FolderPaused:
@@ -121,6 +133,8 @@ func (t EventType) String() string {
 		return "LoginAttempt"
 	case FolderWatchStateChanged:
 		return "FolderWatchStateChanged"
+	case Failure:
+		return "Failure"
 	default:
 		return "Unknown"
 	}
@@ -156,6 +170,8 @@ func UnmarshalEventType(s string) EventType {
 		return DeviceDisconnected
 	case "DeviceRejected":
 		return DeviceRejected
+	case "PendingDevicesChanged":
+		return PendingDevicesChanged
 	case "LocalChangeDetected":
 		return LocalChangeDetected
 	case "RemoteChangeDetected":
@@ -172,6 +188,8 @@ func UnmarshalEventType(s string) EventType {
 		return StateChanged
 	case "FolderRejected":
 		return FolderRejected
+	case "PendingFoldersChanged":
+		return PendingFoldersChanged
 	case "ConfigSaved":
 		return ConfigSaved
 	case "DownloadProgress":
@@ -188,6 +206,8 @@ func UnmarshalEventType(s string) EventType {
 		return DevicePaused
 	case "DeviceResumed":
 		return DeviceResumed
+	case "ClusterConfigReceived":
+		return ClusterConfigReceived
 	case "FolderScanProgress":
 		return FolderScanProgress
 	case "FolderPaused":
@@ -200,6 +220,8 @@ func UnmarshalEventType(s string) EventType {
 		return LoginAttempt
 	case "FolderWatchStateChanged":
 		return FolderWatchStateChanged
+	case "Failure":
+		return Failure
 	default:
 		return 0
 	}
@@ -214,7 +236,6 @@ type Logger interface {
 }
 
 type logger struct {
-	suture.Service
 	subs                []*subscription
 	nextSubscriptionIDs []int
 	nextGlobalID        int
@@ -222,7 +243,6 @@ type logger struct {
 	events              chan Event
 	funcs               chan func(context.Context)
 	toUnsubscribe       chan *subscription
-	stop                chan struct{}
 }
 
 type Event struct {
@@ -262,7 +282,6 @@ func NewLogger() Logger {
 		funcs:         make(chan func(context.Context)),
 		toUnsubscribe: make(chan *subscription),
 	}
-	l.Service = util.AsService(l.serve, l.String())
 	// Make sure the timer is in the stopped state and hasn't fired anything
 	// into the channel.
 	if !l.timeout.Stop() {
@@ -271,7 +290,7 @@ func NewLogger() Logger {
 	return l
 }
 
-func (l *logger) serve(ctx context.Context) {
+func (l *logger) Serve(ctx context.Context) error {
 loop:
 	for {
 		select {
@@ -297,11 +316,13 @@ loop:
 	for _, s := range l.subs {
 		close(s.events)
 	}
+
+	return nil
 }
 
 func (l *logger) Log(t EventType, data interface{}) {
 	l.events <- Event{
-		Time: time.Now(),
+		Time: time.Now(), // intentionally high precision
 		Type: t,
 		Data: data,
 		// SubscriptionID and GlobalID are set in sendEvent
@@ -530,13 +551,11 @@ type noopLogger struct{}
 
 var NoopLogger Logger = &noopLogger{}
 
-func (*noopLogger) Serve() {}
+func (*noopLogger) Serve(_ context.Context) error { return nil }
 
-func (*noopLogger) Stop() {}
+func (*noopLogger) Log(_ EventType, _ interface{}) {}
 
-func (*noopLogger) Log(t EventType, data interface{}) {}
-
-func (*noopLogger) Subscribe(mask EventType) Subscription {
+func (*noopLogger) Subscribe(_ EventType) Subscription {
 	return &noopSubscription{}
 }
 
@@ -546,11 +565,11 @@ func (*noopSubscription) C() <-chan Event {
 	return nil
 }
 
-func (*noopSubscription) Poll(timeout time.Duration) (Event, error) {
+func (*noopSubscription) Poll(_ time.Duration) (Event, error) {
 	return Event{}, errNoop
 }
 
-func (s *noopSubscription) Mask() EventType {
+func (*noopSubscription) Mask() EventType {
 	return 0
 }
 

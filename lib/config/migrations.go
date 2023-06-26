@@ -11,10 +11,11 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/upgrade"
 	"github.com/syncthing/syncthing/lib/util"
@@ -24,30 +25,38 @@ import (
 // config version. The conversion function can be nil in which case we just
 // update the config version. The order of migrations doesn't matter here,
 // put the newest on top for readability.
-var migrations = migrationSet{
-	{32, migrateToConfigV32},
-	{31, migrateToConfigV31},
-	{30, migrateToConfigV30},
-	{29, migrateToConfigV29},
-	{28, migrateToConfigV28},
-	{27, migrateToConfigV27},
-	{26, nil}, // triggers database update
-	{25, migrateToConfigV25},
-	{24, migrateToConfigV24},
-	{23, migrateToConfigV23},
-	{22, migrateToConfigV22},
-	{21, migrateToConfigV21},
-	{20, migrateToConfigV20},
-	{19, nil}, // Triggers a database tweak
-	{18, migrateToConfigV18},
-	{17, nil}, // Fsync = true removed
-	{16, nil}, // Triggers a database tweak
-	{15, migrateToConfigV15},
-	{14, migrateToConfigV14},
-	{13, migrateToConfigV13},
-	{12, migrateToConfigV12},
-	{11, migrateToConfigV11},
-}
+var (
+	migrations = migrationSet{
+		{37, migrateToConfigV37},
+		{36, migrateToConfigV36},
+		{35, migrateToConfigV35},
+		{34, migrateToConfigV34},
+		{33, migrateToConfigV33},
+		{32, migrateToConfigV32},
+		{31, migrateToConfigV31},
+		{30, migrateToConfigV30},
+		{29, migrateToConfigV29},
+		{28, migrateToConfigV28},
+		{27, migrateToConfigV27},
+		{26, nil}, // triggers database update
+		{25, migrateToConfigV25},
+		{24, migrateToConfigV24},
+		{23, migrateToConfigV23},
+		{22, migrateToConfigV22},
+		{21, migrateToConfigV21},
+		{20, migrateToConfigV20},
+		{19, nil}, // Triggers a database tweak
+		{18, migrateToConfigV18},
+		{17, nil}, // Fsync = true removed
+		{16, nil}, // Triggers a database tweak
+		{15, migrateToConfigV15},
+		{14, migrateToConfigV14},
+		{13, migrateToConfigV13},
+		{12, migrateToConfigV12},
+		{11, migrateToConfigV11},
+	}
+	migrationsMut = sync.Mutex{}
+)
 
 type migrationSet []migration
 
@@ -87,15 +96,59 @@ func (m migration) apply(cfg *Configuration) {
 	cfg.Version = m.targetVersion
 }
 
-func migrateToConfigV31(cfg *Configuration) {
-	// Show a notification about setting User and Password
-	cfg.Options.UnackedNotificationIDs = append(cfg.Options.UnackedNotificationIDs, "authenticationUserAndPassword")
+func migrateToConfigV37(cfg *Configuration) {
+	// "scan ownership" changed name to "send ownership"
+	for i := range cfg.Folders {
+		cfg.Folders[i].SendOwnership = cfg.Folders[i].DeprecatedScanOwnership
+		cfg.Folders[i].DeprecatedScanOwnership = false
+	}
+}
+
+func migrateToConfigV36(cfg *Configuration) {
+	for i := range cfg.Folders {
+		delete(cfg.Folders[i].Versioning.Params, "cleanInterval")
+	}
+}
+
+func migrateToConfigV35(cfg *Configuration) {
+	for i, fcfg := range cfg.Folders {
+		params := fcfg.Versioning.Params
+		if params["fsType"] != "" {
+			var fsType fs.FilesystemType
+			_ = fsType.UnmarshalText([]byte(params["fsType"]))
+			cfg.Folders[i].Versioning.FSType = fsType
+		}
+		if params["versionsPath"] != "" && params["fsPath"] == "" {
+			params["fsPath"] = params["versionsPath"]
+		}
+		cfg.Folders[i].Versioning.FSPath = params["fsPath"]
+		delete(cfg.Folders[i].Versioning.Params, "fsType")
+		delete(cfg.Folders[i].Versioning.Params, "fsPath")
+		delete(cfg.Folders[i].Versioning.Params, "versionsPath")
+	}
+}
+
+func migrateToConfigV34(cfg *Configuration) {
+	cfg.Defaults.Folder.Path = cfg.Options.DeprecatedDefaultFolderPath
+	cfg.Options.DeprecatedDefaultFolderPath = ""
+}
+
+func migrateToConfigV33(cfg *Configuration) {
+	for i := range cfg.Devices {
+		cfg.Devices[i].DeprecatedPendingFolders = nil
+	}
+	cfg.DeprecatedPendingDevices = nil
 }
 
 func migrateToConfigV32(cfg *Configuration) {
 	for i := range cfg.Folders {
 		cfg.Folders[i].JunctionsAsDirs = true
 	}
+}
+
+func migrateToConfigV31(cfg *Configuration) {
+	// Show a notification about setting User and Password
+	cfg.Options.UnackedNotificationIDs = append(cfg.Options.UnackedNotificationIDs, "authenticationUserAndPassword")
 }
 
 func migrateToConfigV30(cfg *Configuration) {
@@ -145,7 +198,7 @@ func migrateToConfigV24(cfg *Configuration) {
 
 func migrateToConfigV23(cfg *Configuration) {
 	permBits := fs.FileMode(0777)
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		// Windows has no umask so we must chose a safer set of bits to
 		// begin with.
 		permBits = 0700
@@ -155,7 +208,7 @@ func migrateToConfigV23(cfg *Configuration) {
 	// marker name in later versions.
 
 	for i := range cfg.Folders {
-		fs := cfg.Folders[i].Filesystem()
+		fs := cfg.Folders[i].Filesystem(nil)
 		// Invalid config posted, or tests.
 		if fs == nil {
 			continue
@@ -191,18 +244,18 @@ func migrateToConfigV21(cfg *Configuration) {
 		switch folder.Versioning.Type {
 		case "simple", "trashcan":
 			// Clean out symlinks in the known place
-			cleanSymlinks(folder.Filesystem(), ".stversions")
+			cleanSymlinks(folder.Filesystem(nil), ".stversions")
 		case "staggered":
 			versionDir := folder.Versioning.Params["versionsPath"]
 			if versionDir == "" {
 				// default place
-				cleanSymlinks(folder.Filesystem(), ".stversions")
+				cleanSymlinks(folder.Filesystem(nil), ".stversions")
 			} else if filepath.IsAbs(versionDir) {
 				// absolute
 				cleanSymlinks(fs.NewFilesystem(fs.FilesystemTypeBasic, versionDir), ".")
 			} else {
 				// relative to folder
-				cleanSymlinks(folder.Filesystem(), versionDir)
+				cleanSymlinks(folder.Filesystem(nil), versionDir)
 			}
 		}
 	}

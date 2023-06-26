@@ -4,6 +4,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:generate -command counterfeiter go run github.com/maxbrunsfeld/counterfeiter/v6
+//go:generate counterfeiter -o mocks/manager.go --fake-name Manager . Manager
+
 package discover
 
 import (
@@ -13,11 +16,13 @@ import (
 	"sort"
 	"time"
 
-	"github.com/thejerf/suture"
+	"github.com/thejerf/suture/v4"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/svcutil"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/syncthing/syncthing/lib/util"
 )
@@ -40,32 +45,35 @@ type manager struct {
 	cert          tls.Certificate
 	evLogger      events.Logger
 	addressLister AddressLister
+	registry      *registry.Registry
 
 	finders map[string]cachedFinder
 	mut     sync.RWMutex
 }
 
-func NewManager(myID protocol.DeviceID, cfg config.Wrapper, cert tls.Certificate, evLogger events.Logger, lister AddressLister) Manager {
-	return &manager{
-		Supervisor: suture.New("discover.Manager", suture.Spec{
-			PassThroughPanics: true,
-		}),
+func NewManager(myID protocol.DeviceID, cfg config.Wrapper, cert tls.Certificate, evLogger events.Logger, lister AddressLister, registry *registry.Registry) Manager {
+	m := &manager{
+		Supervisor:    suture.New("discover.Manager", svcutil.SpecWithDebugLogger(l)),
 		myID:          myID,
 		cfg:           cfg,
 		cert:          cert,
 		evLogger:      evLogger,
 		addressLister: lister,
+		registry:      registry,
 
 		finders: make(map[string]cachedFinder),
 		mut:     sync.NewRWMutex(),
 	}
+	m.Add(svcutil.AsService(m.serve, m.String()))
+	return m
 }
 
-func (m *manager) Serve() {
+func (m *manager) serve(ctx context.Context) error {
 	m.cfg.Subscribe(m)
-	defer m.cfg.Unsubscribe(m)
 	m.CommitConfiguration(config.Configuration{}, m.cfg.RawCopy())
-	m.Supervisor.Serve()
+	<-ctx.Done()
+	m.cfg.Unsubscribe(m)
+	return nil
 }
 
 func (m *manager) addLocked(identity string, finder Finder, cacheTime, negCacheTime time.Duration) {
@@ -222,10 +230,6 @@ func (m *manager) Cache() map[protocol.DeviceID]CacheEntry {
 	return res
 }
 
-func (m *manager) VerifyConfiguration(_, _ config.Configuration) error {
-	return nil
-}
-
 func (m *manager) CommitConfiguration(_, to config.Configuration) (handled bool) {
 	m.mut.Lock()
 	defer m.mut.Unlock()
@@ -256,7 +260,7 @@ func (m *manager) CommitConfiguration(_, to config.Configuration) (handled bool)
 			if _, ok := m.finders[identity]; ok {
 				continue
 			}
-			gd, err := NewGlobal(srv, m.cert, m.addressLister, m.evLogger)
+			gd, err := NewGlobal(srv, m.cert, m.addressLister, m.evLogger, m.registry)
 			if err != nil {
 				l.Warnln("Global discovery:", err)
 				continue

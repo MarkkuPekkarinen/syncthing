@@ -8,7 +8,6 @@ package db
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -17,23 +16,20 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-// List of all dbVersion to dbMinSyncthingVersion pairs for convenience
-//   0: v0.14.0
-//   1: v0.14.46
-//   2: v0.14.48
-//   3-5: v0.14.49
-//   6: v0.14.50
-//   7: v0.14.53
-//   8-9: v1.4.0
-//   10-11: v1.6.0
-//   12-13: v1.7.0
-//   14: v1.9.0
+// dbMigrationVersion is for migrations that do not change the schema and thus
+// do not put restrictions on downgrades (e.g. for repairs after a bugfix).
 const (
 	dbVersion             = 14
+	dbMigrationVersion    = 19
 	dbMinSyncthingVersion = "v1.9.0"
 )
 
-var errFolderMissing = errors.New("folder present in global list but missing in keyer index")
+type migration struct {
+	schemaVersion       int64
+	migrationVersion    int64
+	minSyncthingVersion string
+	migration           func(prevSchema int) error
+}
 
 type databaseDowngradeError struct {
 	minSyncthingVersion string
@@ -46,6 +42,8 @@ func (e *databaseDowngradeError) Error() string {
 	return fmt.Sprintf("Syncthing %s required", e.minSyncthingVersion)
 }
 
+// UpdateSchema updates a possibly outdated database to the current schema and
+// also does repairs where necessary.
 func UpdateSchema(db *Lowlevel) error {
 	updater := &schemaUpdater{db}
 	return updater.updateSchema()
@@ -77,46 +75,71 @@ func (db *schemaUpdater) updateSchema() error {
 		return err
 	}
 
-	if prevVersion == dbVersion {
+	prevMigration, _, err := miscDB.Int64("dbMigrationVersion")
+	if err != nil {
+		return err
+	}
+	// Cover versions before adding `dbMigrationVersion` (== 0) and possible future weirdness.
+	if prevMigration < prevVersion {
+		prevMigration = prevVersion
+	}
+
+	if prevVersion == dbVersion && prevMigration >= dbMigrationVersion {
 		return nil
 	}
 
-	type migration struct {
-		schemaVersion int64
-		migration     func(prevVersion int) error
-	}
-	var migrations = []migration{
-		{1, db.updateSchema0to1},
-		{2, db.updateSchema1to2},
-		{3, db.updateSchema2to3},
-		{5, db.updateSchemaTo5},
-		{6, db.updateSchema5to6},
-		{7, db.updateSchema6to7},
-		{9, db.updateSchemaTo9},
-		{10, db.updateSchemaTo10},
-		{11, db.updateSchemaTo11},
-		{13, db.updateSchemaTo13},
-		{14, db.updateSchemaTo14},
+	migrations := []migration{
+		{1, 1, "v0.14.0", db.updateSchema0to1},
+		{2, 2, "v0.14.46", db.updateSchema1to2},
+		{3, 3, "v0.14.48", db.updateSchema2to3},
+		{5, 5, "v0.14.49", db.updateSchemaTo5},
+		{6, 6, "v0.14.50", db.updateSchema5to6},
+		{7, 7, "v0.14.53", db.updateSchema6to7},
+		{9, 9, "v1.4.0", db.updateSchemaTo9},
+		{10, 10, "v1.6.0", db.updateSchemaTo10},
+		{11, 11, "v1.6.0", db.updateSchemaTo11},
+		{13, 13, "v1.7.0", db.updateSchemaTo13},
+		{14, 14, "v1.9.0", db.updateSchemaTo14},
+		{14, 16, "v1.9.0", db.checkRepairMigration},
+		{14, 17, "v1.9.0", db.migration17},
+		{14, 19, "v1.9.0", db.dropIndexIDsMigration},
 	}
 
 	for _, m := range migrations {
-		if prevVersion < m.schemaVersion {
-			l.Infof("Migrating database to schema version %d...", m.schemaVersion)
+		if prevMigration < m.migrationVersion {
+			l.Infof("Running database migration %d...", m.migrationVersion)
 			if err := m.migration(int(prevVersion)); err != nil {
-				return fmt.Errorf("failed migrating to version %v: %w", m.schemaVersion, err)
+				return fmt.Errorf("failed to do migration %v: %w", m.migrationVersion, err)
+			}
+			if err := db.writeVersions(m, miscDB); err != nil {
+				return fmt.Errorf("failed to write versions after migration %v: %w", m.migrationVersion, err)
 			}
 		}
 	}
 
-	if err := miscDB.PutInt64("dbVersion", dbVersion); err != nil {
-		return err
-	}
-	if err := miscDB.PutString("dbMinSyncthingVersion", dbMinSyncthingVersion); err != nil {
-		return err
+	if err := db.writeVersions(migration{
+		schemaVersion:       dbVersion,
+		migrationVersion:    dbMigrationVersion,
+		minSyncthingVersion: dbMinSyncthingVersion,
+	}, miscDB); err != nil {
+		return fmt.Errorf("failed to write versions after migrations: %w", err)
 	}
 
 	l.Infoln("Compacting database after migration...")
 	return db.Compact()
+}
+
+func (*schemaUpdater) writeVersions(m migration, miscDB *NamespacedKV) error {
+	if err := miscDB.PutInt64("dbVersion", m.schemaVersion); err != nil && err == nil {
+		return err
+	}
+	if err := miscDB.PutString("dbMinSyncthingVersion", m.minSyncthingVersion); err != nil && err == nil {
+		return err
+	}
+	if err := miscDB.PutInt64("dbMigrationVersion", m.migrationVersion); err != nil && err == nil {
+		return err
+	}
+	return nil
 }
 
 func (db *schemaUpdater) updateSchema0to1(_ int) error {
@@ -198,7 +221,7 @@ func (db *schemaUpdater) updateSchema0to1(_ int) error {
 			// probably can't happen
 			continue
 		}
-		if f.Type == protocol.FileInfoTypeDeprecatedSymlinkDirectory || f.Type == protocol.FileInfoTypeDeprecatedSymlinkFile {
+		if f.Type == protocol.FileInfoTypeSymlinkDirectory || f.Type == protocol.FileInfoTypeSymlinkFile {
 			f.Type = protocol.FileInfoTypeSymlink
 			bs, err := f.Marshal()
 			if err != nil {
@@ -221,8 +244,7 @@ func (db *schemaUpdater) updateSchema0to1(_ int) error {
 			if err != nil && !backend.IsNotFound(err) {
 				return err
 			}
-			i := 0
-			i = sort.Search(len(fl.Versions), func(j int) bool {
+			i := sort.Search(len(fl.Versions), func(j int) bool {
 				return fl.Versions[j].Invalid
 			})
 			for ; i < len(fl.Versions); i++ {
@@ -497,7 +519,7 @@ func (db *schemaUpdater) updateSchema6to7(_ int) error {
 	return t.Commit()
 }
 
-func (db *schemaUpdater) updateSchemaTo9(prev int) error {
+func (db *schemaUpdater) updateSchemaTo9(_ int) error {
 	// Loads and rewrites all files with blocks, to deduplicate block lists.
 
 	t, err := db.newReadWriteTransaction()
@@ -506,7 +528,7 @@ func (db *schemaUpdater) updateSchemaTo9(prev int) error {
 	}
 	defer t.close()
 
-	if err := db.rewriteFiles(t); err != nil {
+	if err := rewriteFiles(t); err != nil {
 		return err
 	}
 
@@ -515,7 +537,7 @@ func (db *schemaUpdater) updateSchemaTo9(prev int) error {
 	return t.Commit()
 }
 
-func (db *schemaUpdater) rewriteFiles(t readWriteTransaction) error {
+func rewriteFiles(t readWriteTransaction) error {
 	it, err := t.NewPrefixIterator([]byte{KeyTypeDevice})
 	if err != nil {
 		return err
@@ -673,12 +695,12 @@ func (db *schemaUpdater) updateSchemaTo13(prev int) error {
 	defer t.close()
 
 	if prev < 12 {
-		if err := db.rewriteFiles(t); err != nil {
+		if err := rewriteFiles(t); err != nil {
 			return err
 		}
 	}
 
-	if err := db.rewriteGlobals(t); err != nil {
+	if err := rewriteGlobals(t); err != nil {
 		return err
 	}
 
@@ -695,7 +717,7 @@ func (db *schemaUpdater) updateSchemaTo14(_ int) error {
 	var key, gk []byte
 	for _, folderStr := range db.ListFolders() {
 		folder := []byte(folderStr)
-		meta := newMetadataTracker(db.keyer)
+		meta := newMetadataTracker(db.keyer, db.evLogger)
 		meta.counts.Created = 0 // Recalculate metadata afterwards
 
 		t, err := db.newReadWriteTransaction(meta.CommitHook(folder))
@@ -705,6 +727,9 @@ func (db *schemaUpdater) updateSchemaTo14(_ int) error {
 		defer t.close()
 
 		key, err = t.keyer.GenerateDeviceFileKey(key, folder, protocol.LocalDeviceID[:], nil)
+		if err != nil {
+			return err
+		}
 		it, err := t.NewPrefixIterator(key)
 		if err != nil {
 			return err
@@ -724,7 +749,7 @@ func (db *schemaUpdater) updateSchemaTo14(_ int) error {
 				continue
 			}
 
-			fi.SetMustRescan(protocol.LocalDeviceID.Short())
+			fi.SetMustRescan()
 			if err = t.putFile(it.Key(), fi); err != nil {
 				return err
 			}
@@ -733,7 +758,7 @@ func (db *schemaUpdater) updateSchemaTo14(_ int) error {
 			if err != nil {
 				return err
 			}
-			key, _, err = t.updateGlobal(gk, key, folder, protocol.LocalDeviceID[:], fi, meta)
+			key, err = t.updateGlobal(gk, key, folder, protocol.LocalDeviceID[:], fi, meta)
 			if err != nil {
 				return err
 			}
@@ -749,12 +774,74 @@ func (db *schemaUpdater) updateSchemaTo14(_ int) error {
 	return nil
 }
 
-func (db *schemaUpdater) rewriteGlobals(t readWriteTransaction) error {
+func (db *schemaUpdater) checkRepairMigration(_ int) error {
+	for _, folder := range db.ListFolders() {
+		_, err := db.getMetaAndCheckGCLocked(folder)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration17 finds all files that were pulled as invalid from an invalid
+// global and make sure they get scanned/pulled again.
+func (db *schemaUpdater) migration17(prev int) error {
+	if prev < 16 {
+		// Issue was introduced in migration to 16
+		return nil
+	}
+	t, err := db.newReadOnlyTransaction()
+	if err != nil {
+		return err
+	}
+	defer t.close()
+
+	for _, folderStr := range db.ListFolders() {
+		folder := []byte(folderStr)
+		meta, err := db.loadMetadataTracker(folderStr)
+		if err != nil {
+			return err
+		}
+		batch := NewFileInfoBatch(func(fs []protocol.FileInfo) error {
+			return db.updateLocalFiles(folder, fs, meta)
+		})
+		var innerErr error
+		err = t.withHave(folder, protocol.LocalDeviceID[:], nil, false, func(fi protocol.FileIntf) bool {
+			if fi.IsInvalid() && fi.FileLocalFlags() == 0 {
+				f := fi.(protocol.FileInfo)
+				f.SetMustRescan()
+				f.Version = protocol.Vector{}
+				batch.Append(f)
+				innerErr = batch.FlushIfFull()
+				return innerErr == nil
+			}
+			return true
+		})
+		if innerErr != nil {
+			return innerErr
+		}
+		if err != nil {
+			return err
+		}
+		if err := batch.Flush(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *schemaUpdater) dropIndexIDsMigration(_ int) error {
+	return db.dropIndexIDs()
+}
+
+func rewriteGlobals(t readWriteTransaction) error {
 	it, err := t.NewPrefixIterator([]byte{KeyTypeGlobal})
 	if err != nil {
 		return err
 	}
 	defer it.Release()
+
 	for it.Next() {
 		var vl VersionListDeprecated
 		if err := vl.Unmarshal(it.Value()); err != nil {
@@ -772,10 +859,7 @@ func (db *schemaUpdater) rewriteGlobals(t readWriteTransaction) error {
 			}
 		}
 
-		newVl, err := convertVersionList(vl)
-		if err != nil {
-			return err
-		}
+		newVl := convertVersionList(vl)
 		if err := t.Put(it.Key(), mustMarshal(&newVl)); err != nil {
 			return err
 		}
@@ -783,11 +867,10 @@ func (db *schemaUpdater) rewriteGlobals(t readWriteTransaction) error {
 			return err
 		}
 	}
-	it.Release()
 	return it.Error()
 }
 
-func convertVersionList(vl VersionListDeprecated) (VersionList, error) {
+func convertVersionList(vl VersionListDeprecated) VersionList {
 	var newVl VersionList
 	var newPos, oldPos int
 	var lastVersion protocol.Vector
@@ -807,7 +890,7 @@ func convertVersionList(vl VersionListDeprecated) (VersionList, error) {
 	}
 
 	if oldPos == len(vl.Versions) {
-		return newVl, nil
+		return newVl
 	}
 
 	if len(newVl.RawVersions) == 0 {
@@ -822,11 +905,9 @@ outer:
 			switch nfv.Version.Compare(fv.Version) {
 			case protocol.Equal:
 				newVl.RawVersions[newPos].InvalidDevices = append(newVl.RawVersions[newPos].InvalidDevices, fv.Device)
-				lastVersion = fv.Version
 				continue outer
 			case protocol.Lesser:
 				newVl.insertAt(newPos, newFileVersion(fv.Device, fv.Version, true, fv.Deleted))
-				lastVersion = fv.Version
 				continue outer
 			case protocol.ConcurrentLesser, protocol.ConcurrentGreater:
 				// The version is invalid, i.e. it looses anyway,
@@ -836,11 +917,10 @@ outer:
 		}
 		// Couldn't insert into any existing versions
 		newVl.RawVersions = append(newVl.RawVersions, newFileVersion(fv.Device, fv.Version, true, fv.Deleted))
-		lastVersion = fv.Version
 		newPos++
 	}
 
-	return newVl, nil
+	return newVl
 }
 
 func getGlobalVersionsByKeyBefore11(key []byte, t readOnlyTransaction) (VersionListDeprecated, error) {

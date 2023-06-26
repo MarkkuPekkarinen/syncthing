@@ -15,7 +15,7 @@ import (
 // sentFolderFileDownloadState represents a state of what we've announced as available
 // to some remote device for a specific file.
 type sentFolderFileDownloadState struct {
-	blockIndexes []int32
+	blockIndexes []int
 	version      protocol.Vector
 	updated      time.Time
 	created      time.Time
@@ -44,7 +44,7 @@ func (s *sentFolderDownloadState) update(pullers []*sharedPullerState) []protoco
 		pullerVersion := puller.file.Version
 		pullerBlockIndexesUpdated := puller.AvailableUpdated()
 		pullerCreated := puller.created
-		pullerBlockSize := int32(puller.file.BlockSize())
+		pullerBlockSize := puller.file.BlockSize()
 
 		localFile, ok := s.files[name]
 
@@ -57,13 +57,13 @@ func (s *sentFolderDownloadState) update(pullers []*sharedPullerState) []protoco
 					updated:      pullerBlockIndexesUpdated,
 					version:      pullerVersion,
 					created:      pullerCreated,
-					blockSize:    int(pullerBlockSize),
+					blockSize:    pullerBlockSize,
 				}
 
 				updates = append(updates, protocol.FileDownloadProgressUpdate{
 					Name:         name,
 					Version:      pullerVersion,
-					UpdateType:   protocol.UpdateTypeAppend,
+					UpdateType:   protocol.FileDownloadProgressUpdateTypeAppend,
 					BlockIndexes: pullerBlockIndexes,
 					BlockSize:    pullerBlockSize,
 				})
@@ -78,20 +78,21 @@ func (s *sentFolderDownloadState) update(pullers []*sharedPullerState) []protoco
 		}
 
 		if !pullerVersion.Equal(localFile.version) || !pullerCreated.Equal(localFile.created) {
-			// The version has changed or the puller was reconstrcuted due to failure.
+			// The version has changed or the puller was reconstructed due to failure.
 			// Clean up whatever we had for the old file, and advertise the new file.
-			updates = append(updates, protocol.FileDownloadProgressUpdate{
-				Name:       name,
-				Version:    localFile.version,
-				UpdateType: protocol.UpdateTypeForget,
-			})
-			updates = append(updates, protocol.FileDownloadProgressUpdate{
-				Name:         name,
-				Version:      pullerVersion,
-				UpdateType:   protocol.UpdateTypeAppend,
-				BlockIndexes: pullerBlockIndexes,
-				BlockSize:    pullerBlockSize,
-			})
+			updates = append(updates,
+				protocol.FileDownloadProgressUpdate{
+					Name:       name,
+					Version:    localFile.version,
+					UpdateType: protocol.FileDownloadProgressUpdateTypeForget,
+				},
+				protocol.FileDownloadProgressUpdate{
+					Name:         name,
+					Version:      pullerVersion,
+					UpdateType:   protocol.FileDownloadProgressUpdateTypeAppend,
+					BlockIndexes: pullerBlockIndexes,
+					BlockSize:    pullerBlockSize,
+				})
 			localFile.blockIndexes = pullerBlockIndexes
 			localFile.updated = pullerBlockIndexesUpdated
 			localFile.version = pullerVersion
@@ -112,7 +113,7 @@ func (s *sentFolderDownloadState) update(pullers []*sharedPullerState) []protoco
 			updates = append(updates, protocol.FileDownloadProgressUpdate{
 				Name:         name,
 				Version:      localFile.version,
-				UpdateType:   protocol.UpdateTypeAppend,
+				UpdateType:   protocol.FileDownloadProgressUpdateTypeAppend,
 				BlockIndexes: newBlocks,
 				BlockSize:    pullerBlockSize,
 			})
@@ -127,7 +128,7 @@ func (s *sentFolderDownloadState) update(pullers []*sharedPullerState) []protoco
 			updates = append(updates, protocol.FileDownloadProgressUpdate{
 				Name:       name,
 				Version:    info.version,
-				UpdateType: protocol.UpdateTypeForget,
+				UpdateType: protocol.FileDownloadProgressUpdateTypeForget,
 			})
 			delete(s.files, name)
 		}
@@ -144,7 +145,7 @@ func (s *sentFolderDownloadState) destroy() []protocol.FileDownloadProgressUpdat
 		updates = append(updates, protocol.FileDownloadProgressUpdate{
 			Name:       name,
 			Version:    info.version,
-			UpdateType: protocol.UpdateTypeForget,
+			UpdateType: protocol.FileDownloadProgressUpdateTypeForget,
 		})
 		delete(s.files, name)
 	}

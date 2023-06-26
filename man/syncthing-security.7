@@ -1,8 +1,5 @@
 .\" Man page generated from reStructuredText.
 .
-.TH "SYNCTHING-SECURITY" "7" "Aug 16, 2020" "v1" "Syncthing"
-.SH NAME
-syncthing-security \- Security Principles
 .
 .nr rst2man-indent-level 0
 .
@@ -30,6 +27,9 @@ level margin: \\n[rst2man-indent\\n[rst2man-indent-level]]
 .\" new: \\n[rst2man-indent\\n[rst2man-indent-level]]
 .in \\n[rst2man-indent\\n[rst2man-indent-level]]u
 ..
+.TH "SYNCTHING-SECURITY" "7" "Jun 12, 2023" "v1.23.5" "Syncthing"
+.SH NAME
+syncthing-security \- Security Principles
 .sp
 Security is one of the primary project goals. This means that it should not be
 possible for an attacker to join a cluster uninvited, and it should not be
@@ -46,7 +46,7 @@ Incoming requests for file data are verified to the extent that the requested
 file name must exist in the local index and the global model.
 .sp
 For information about ensuring you are running the code you think you are and
-for reporting security vulnerabilities, please see the official \fI\%security page\fP <\fBhttps://syncthing.net/security.html\fP>\&.
+for reporting security vulnerabilities, please see the official \fI\%security page\fP <\fBhttps://syncthing.net/security\fP>\&.
 .SH INFORMATION LEAKAGE
 .SS Global Discovery
 .sp

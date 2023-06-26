@@ -9,9 +9,9 @@ package ur
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
+	"math/rand"
 	"net"
 	"net/http"
 	"runtime"
@@ -23,15 +23,12 @@ import (
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/connections"
+	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/dialer"
-	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
 	"github.com/syncthing/syncthing/lib/upgrade"
 	"github.com/syncthing/syncthing/lib/ur/contract"
-	"github.com/syncthing/syncthing/lib/util"
-
-	"github.com/thejerf/suture"
 )
 
 // Current version number of the usage report, for acceptance purposes. If
@@ -39,27 +36,29 @@ import (
 // are prompted for acceptance of the new report.
 const Version = 3
 
-var StartTime = time.Now()
+var StartTime = time.Now().Truncate(time.Second)
+
+type Model interface {
+	DBSnapshot(folder string) (*db.Snapshot, error)
+	UsageReportingStats(report *contract.Report, version int, preview bool)
+}
 
 type Service struct {
-	suture.Service
 	cfg                config.Wrapper
-	model              model.Model
+	model              Model
 	connectionsService connections.Service
 	noUpgrade          bool
 	forceRun           chan struct{}
 }
 
-func New(cfg config.Wrapper, m model.Model, connectionsService connections.Service, noUpgrade bool) *Service {
-	svc := &Service{
+func New(cfg config.Wrapper, m Model, connectionsService connections.Service, noUpgrade bool) *Service {
+	return &Service{
 		cfg:                cfg,
 		model:              m,
 		connectionsService: connectionsService,
 		noUpgrade:          noUpgrade,
 		forceRun:           make(chan struct{}, 1), // Buffered to prevent locking
 	}
-	svc.Service = util.AsService(svc.serve, svc.String())
-	return svc
 }
 
 // ReportData returns the data to be sent in a usage report with the currently
@@ -77,6 +76,7 @@ func (s *Service) ReportDataPreview(ctx context.Context, urVersion int) (*contra
 
 func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (*contract.Report, error) {
 	opts := s.cfg.Options()
+	defaultFolder := s.cfg.DefaultFolder()
 
 	var totFiles, maxFiles int
 	var totBytes, maxBytes int64
@@ -164,11 +164,11 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			report.DeviceUses.CustomCertName++
 		}
 		switch cfg.Compression {
-		case protocol.CompressAlways:
+		case protocol.CompressionAlways:
 			report.DeviceUses.CompressAlways++
-		case protocol.CompressMetadata:
+		case protocol.CompressionMetadata:
 			report.DeviceUses.CompressMetadata++
-		case protocol.CompressNever:
+		case protocol.CompressionNever:
 			report.DeviceUses.CompressNever++
 		default:
 			l.Warnf("Unhandled versioning type for usage reports: %s", cfg.Compression)
@@ -218,14 +218,13 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 		report.CacheIgnoredFiles = opts.CacheIgnoredFiles
 		report.OverwriteRemoteDeviceNames = opts.OverwriteRemoteDevNames
 		report.ProgressEmitterEnabled = opts.ProgressUpdateIntervalS > -1
-		report.CustomDefaultFolderPath = opts.DefaultFolderPath != "~"
+		report.CustomDefaultFolderPath = defaultFolder.Path != "~"
 		report.CustomTrafficClass = opts.TrafficClass != 0
 		report.CustomTempIndexMinBlocks = opts.TempIndexMinBlocks != 10
 		report.TemporariesDisabled = opts.KeepTemporariesH == 0
 		report.TemporariesCustom = opts.KeepTemporariesH != 24
 		report.LimitBandwidthInLan = opts.LimitBandwidthInLan
-		report.CustomReleaseURL = opts.ReleasesURL != "https=//upgrades.syncthing.net/meta.json"
-		report.RestartOnWakeup = opts.RestartOnWakeup
+		report.CustomReleaseURL = opts.ReleasesURL != "https://upgrades.syncthing.net/meta.json"
 		report.CustomStunServers = len(opts.RawStunServers) != 1 || opts.RawStunServers[0] != "default"
 
 		for _, cfg := range s.cfg.Folders() {
@@ -255,7 +254,7 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			}
 			report.FolderUsesV3.PullOrder[cfg.Order.String()]++
 			report.FolderUsesV3.FilesystemType[cfg.FilesystemType.String()]++
-			report.FolderUsesV3.FsWatcherDelays = append(report.FolderUsesV3.FsWatcherDelays, cfg.FSWatcherDelayS)
+			report.FolderUsesV3.FsWatcherDelays = append(report.FolderUsesV3.FsWatcherDelays, int(cfg.FSWatcherDelayS))
 			if cfg.MarkerName != config.DefaultMarkerName {
 				report.FolderUsesV3.CustomMarkerName++
 			}
@@ -272,8 +271,17 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			if cfg.CaseSensitiveFS {
 				report.FolderUsesV3.CaseSensitiveFS++
 			}
+			if cfg.Type == config.FolderTypeReceiveEncrypted {
+				report.FolderUsesV3.ReceiveEncrypted++
+			}
 		}
 		sort.Ints(report.FolderUsesV3.FsWatcherDelays)
+
+		for _, cfg := range s.cfg.Devices() {
+			if cfg.Untrusted {
+				report.DeviceUsesV3.Untrusted++
+			}
+		}
 
 		guiCfg := s.cfg.GUI()
 		// Anticipate multiple GUI configs in the future, hence store counts.
@@ -302,7 +310,6 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			if err == nil {
 				if addr.IP.IsLoopback() {
 					report.GUIStats.ListenLocal++
-
 				} else if addr.IP.IsUnspecified() {
 					report.GUIStats.ListenUnspecified++
 				}
@@ -320,7 +327,7 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 	return report, nil
 }
 
-func (s *Service) UptimeS() int {
+func (*Service) UptimeS() int {
 	return int(time.Since(StartTime).Seconds())
 }
 
@@ -356,7 +363,7 @@ func (s *Service) sendUsageReport(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) serve(ctx context.Context) {
+func (s *Service) Serve(ctx context.Context) error {
 	s.cfg.Subscribe(s)
 	defer s.cfg.Unsubscribe(s)
 
@@ -364,7 +371,7 @@ func (s *Service) serve(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-s.forceRun:
 			t.Reset(0)
 		case <-t.C:
@@ -379,10 +386,6 @@ func (s *Service) serve(ctx context.Context) {
 			t.Reset(24 * time.Hour) // next report tomorrow
 		}
 	}
-}
-
-func (s *Service) VerifyConfiguration(from, to config.Configuration) error {
-	return nil
 }
 
 func (s *Service) CommitConfiguration(from, to config.Configuration) bool {
@@ -413,7 +416,8 @@ func CpuBench(ctx context.Context, iterations int, duration time.Duration, useWe
 
 	dataSize := 16 * protocol.MinBlockSize
 	bs := make([]byte, dataSize)
-	rand.Reader.Read(bs)
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	r.Read(bs)
 
 	var perf float64
 	for i := 0; i < iterations; i++ {
@@ -421,7 +425,12 @@ func CpuBench(ctx context.Context, iterations int, duration time.Duration, useWe
 			perf = v
 		}
 	}
-	blocksResult = nil
+	// not looking at the blocksResult makes it unused from a static
+	// analysis / compiler standpoint...
+	// blocksResult may be nil at this point if the context is cancelled
+	if blocksResult != nil {
+		blocksResult = nil
+	}
 	return perf
 }
 

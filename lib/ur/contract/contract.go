@@ -129,7 +129,12 @@ type Report struct {
 		BlockPullOrder          map[string]int `json:"blockPullOrder,omitempty" since:"3"`
 		CopyRangeMethod         map[string]int `json:"copyRangeMethod,omitempty" since:"3"`
 		CaseSensitiveFS         int            `json:"caseSensitiveFS,omitempty" since:"3"`
+		ReceiveEncrypted        int            `json:"receiveencrypted,omitempty" since:"3"`
 	} `json:"folderUsesV3,omitempty" since:"3"`
+
+	DeviceUsesV3 struct {
+		Untrusted int `json:"untrusted,omitempty" since:"3"`
+	} `json:"deviceUsesV3,omitempty" since:"3"`
 
 	GUIStats struct {
 		Enabled                   int            `json:"enabled,omitempty" since:"3"`
@@ -261,7 +266,7 @@ func (r *Report) FieldPointers() []interface{} {
 	}
 }
 
-func (r *Report) FieldNames() []string {
+func (*Report) FieldNames() []string {
 	// The database fields that back this struct in PostgreSQL
 	return []string{
 		// V1
@@ -289,9 +294,9 @@ func (r *Report) FieldNames() []string {
 		"FolderAutoNormalize",
 		"DeviceIntroducer",
 		"DeviceCustomCertName",
-		"DeviceCompressAlways",
-		"DeviceCompressMetadata",
-		"DeviceCompressNever",
+		"DeviceCompressionAlways",
+		"DeviceCompressionMetadata",
+		"DeviceCompressionNever",
 		"DeviceDynamicAddr",
 		"DeviceStaticAddr",
 		"AnnounceGlobalEnabled",
@@ -405,7 +410,7 @@ func clear(v interface{}, since int) error {
 		tag := t.Field(i).Tag
 
 		v := tag.Get("since")
-		if len(v) == 0 {
+		if v == "" {
 			f.Set(reflect.Zero(f.Type()))
 			continue
 		}

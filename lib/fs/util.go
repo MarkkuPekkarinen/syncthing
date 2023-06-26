@@ -7,15 +7,16 @@
 package fs
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
+	"unicode"
+
+	"github.com/syncthing/syncthing/lib/build"
 )
 
-var errNoHome = errors.New("no home directory found - set $HOME (or the platform equivalent)")
+const pathSeparatorString = string(PathSeparator)
 
 func ExpandTilde(path string) (string, error) {
 	if path == "~" {
@@ -35,7 +36,7 @@ func ExpandTilde(path string) (string, error) {
 }
 
 func getHomeDir() (string, error) {
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		// Legacy -- we prioritize this for historical reasons, whereas
 		// os.UserHomeDir uses %USERPROFILE% always.
 		home := filepath.Join(os.Getenv("HomeDrive"), os.Getenv("HomePath"))
@@ -47,28 +48,105 @@ func getHomeDir() (string, error) {
 	return os.UserHomeDir()
 }
 
-var windowsDisallowedCharacters = string([]rune{
-	'<', '>', ':', '"', '|', '?', '*',
-	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-	11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-	21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-	31,
-})
+const windowsDisallowedCharacters = (`<>:"|?*` +
+	"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f" +
+	"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f")
 
-func WindowsInvalidFilename(name string) bool {
-	// None of the path components should end in space
-	for _, part := range strings.Split(name, `\`) {
-		if len(part) == 0 {
+func WindowsInvalidFilename(name string) error {
+	// The path must not contain any disallowed characters.
+	if strings.ContainsAny(name, windowsDisallowedCharacters) {
+		return errInvalidFilenameWindowsReservedChar
+	}
+
+	// None of the path components should end in space or period, or be a
+	// reserved name.
+	for len(name) > 0 {
+		part, rest, _ := strings.Cut(name, `\`)
+		name = rest
+
+		if part == "" {
 			continue
 		}
-		if part[len(part)-1] == ' ' {
-			// Names ending in space are not valid.
-			return true
+		switch part[len(part)-1] {
+		case ' ', '.':
+			// Names ending in space or period are not valid.
+			return errInvalidFilenameWindowsSpacePeriod
+		}
+		if windowsIsReserved(part) {
+			return errInvalidFilenameWindowsReservedName
 		}
 	}
 
-	// The path must not contain any disallowed characters
-	return strings.ContainsAny(name, windowsDisallowedCharacters)
+	return nil
+}
+
+// SanitizePath takes a string that might contain all kinds of special
+// characters and makes a valid, similar, path name out of it.
+//
+// Spans of invalid characters, whitespace and/or non-UTF-8 sequences are
+// replaced by a single space. The result is always UTF-8 and contains only
+// printable characters, as determined by unicode.IsPrint.
+//
+// Invalid characters are non-printing runes, things not allowed in file names
+// in Windows, and common shell metacharacters. Even if asterisks and pipes
+// and stuff are allowed on Unixes in general they might not be allowed by
+// the filesystem and may surprise the user and cause shell oddness. This
+// function is intended for file names we generate on behalf of the user,
+// and surprising them with odd shell characters in file names is unkind.
+//
+// We include whitespace in the invalid characters so that multiple
+// whitespace is collapsed to a single space. Additionally, whitespace at
+// either end is removed.
+//
+// If the result is a name disallowed on windows, a hyphen is prepended.
+func SanitizePath(path string) string {
+	var b strings.Builder
+
+	const disallowed = `'/\[]{};:!@$%&^#` + windowsDisallowedCharacters
+	prev := ' '
+	for _, c := range path {
+		if !unicode.IsPrint(c) || c == unicode.ReplacementChar ||
+			strings.ContainsRune(disallowed, c) {
+			c = ' '
+		}
+
+		if !(c == ' ' && prev == ' ') {
+			b.WriteRune(c)
+		}
+		prev = c
+	}
+
+	path = strings.TrimSpace(b.String())
+	if windowsIsReserved(path) {
+		path = "-" + path
+	}
+	return path
+}
+
+func windowsIsReserved(part string) bool {
+	// nul.txt.jpg is also disallowed.
+	dot := strings.IndexByte(part, '.')
+	if dot != -1 {
+		part = part[:dot]
+	}
+
+	// Check length to skip allocating ToUpper.
+	if len(part) != 3 && len(part) != 4 {
+		return false
+	}
+
+	// COM0 and LPT0 are missing from the Microsoft docs,
+	// but Windows Explorer treats them as invalid too.
+	// (https://docs.microsoft.com/windows/win32/fileio/naming-a-file)
+	switch strings.ToUpper(part) {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM0", "COM1", "COM2", "COM3", "COM4",
+		"COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT0", "LPT1", "LPT2", "LPT3", "LPT4",
+		"LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return true
+	}
+	return false
 }
 
 // IsParent compares paths purely lexicographically, meaning it returns false
@@ -92,7 +170,7 @@ func IsParent(path, parent string) bool {
 		return path != "/"
 	}
 	if parent[len(parent)-1] != PathSeparator {
-		parent += string(PathSeparator)
+		parent += pathSeparatorString
 	}
 	return strings.HasPrefix(path, parent)
 }
@@ -103,8 +181,8 @@ func CommonPrefix(first, second string) string {
 		return ""
 	}
 
-	firstParts := strings.Split(filepath.Clean(first), string(PathSeparator))
-	secondParts := strings.Split(filepath.Clean(second), string(PathSeparator))
+	firstParts := PathComponents(filepath.Clean(first))
+	secondParts := PathComponents(filepath.Clean(second))
 
 	isAbs := filepath.IsAbs(first) && filepath.IsAbs(second)
 
@@ -122,13 +200,13 @@ func CommonPrefix(first, second string) string {
 	}
 
 	if isAbs {
-		if runtime.GOOS == "windows" && isVolumeNameOnly(common) {
+		if build.IsWindows && isVolumeNameOnly(common) {
 			// Because strings.Split strips out path separators, if we're at the volume name, we end up without a separator
 			// Wedge an empty element to be joined with.
 			common = append(common, "")
 		} else if len(common) == 1 {
 			// If isAbs on non Windows, first element in both first and second is "", hence joining that returns nothing.
-			return string(PathSeparator)
+			return pathSeparatorString
 		}
 	}
 
@@ -139,8 +217,14 @@ func CommonPrefix(first, second string) string {
 	}
 
 	// This has to be strings.Join, because filepath.Join([]string{"", "", "?", "C:", "Audrius"}...) returns garbage
-	result := strings.Join(common, string(PathSeparator))
+	result := strings.Join(common, pathSeparatorString)
 	return filepath.Clean(result)
+}
+
+// PathComponents returns a list of names of parent directories and the leaf
+// item for the given native (fs.PathSeparator delimited) and clean path.
+func PathComponents(path string) []string {
+	return strings.Split(path, pathSeparatorString)
 }
 
 func isVolumeNameOnly(parts []string) bool {

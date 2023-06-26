@@ -4,8 +4,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -16,7 +17,7 @@ const (
 	httpStatusEnhanceYourCalm = 429
 )
 
-func poolHandler(pool string, uri *url.URL, mapping mapping) {
+func poolHandler(pool string, uri *url.URL, mapping mapping, ownCert tls.Certificate) {
 	if debug {
 		log.Println("Joining", pool)
 	}
@@ -31,14 +32,31 @@ func poolHandler(pool string, uri *url.URL, mapping mapping) {
 			uriCopy.String(),
 		})
 
-		resp, err := httpClient.Post(pool, "application/json", &b)
+		poolUrl, err := url.Parse(pool)
+		if err != nil {
+			log.Printf("Could not parse pool url '%s': %v", pool, err)
+		}
+
+		client := http.DefaultClient
+		if poolUrl.Scheme == "https" {
+			// Sent our certificate in join request
+			client = &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						Certificates: []tls.Certificate{ownCert},
+					},
+				},
+			}
+		}
+
+		resp, err := client.Post(pool, "application/json", &b)
 		if err != nil {
 			log.Printf("Error joining pool %v: HTTP request: %v", pool, err)
 			time.Sleep(time.Minute)
 			continue
 		}
 
-		bs, err := ioutil.ReadAll(resp.Body)
+		bs, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
 			log.Printf("Error joining pool %v: reading response: %v", pool, err)
@@ -56,9 +74,8 @@ func poolHandler(pool string, uri *url.URL, mapping mapping) {
 				log.Printf("Joined pool %s, rejoining in %v", pool, rejoin)
 				time.Sleep(rejoin)
 				continue
-			} else {
-				log.Printf("Joined pool %s, failed to deserialize response: %v", pool, err)
 			}
+			log.Printf("Joined pool %s, failed to deserialize response: %v", pool, err)
 
 		case http.StatusInternalServerError:
 			log.Printf("Failed to join %v: server error", pool)

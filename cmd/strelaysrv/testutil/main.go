@@ -20,7 +20,8 @@ import (
 )
 
 func main() {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -56,13 +57,13 @@ func main() {
 
 	if join {
 		log.Println("Creating client")
-		relay, err := client.NewClient(uri, []tls.Certificate{cert}, nil, 10*time.Second)
+		relay, err := client.NewClient(uri, []tls.Certificate{cert}, 10*time.Second)
 		if err != nil {
 			log.Fatal(err)
 		}
 		log.Println("Created client")
 
-		go relay.Serve()
+		go relay.Serve(ctx)
 
 		recv := make(chan protocol.SessionInvitation)
 
@@ -126,10 +127,6 @@ func stdinReader(c chan<- string) {
 }
 
 func connectToStdio(stdin <-chan string, conn net.Conn) {
-	go func() {
-
-	}()
-
 	buf := make([]byte, 1024)
 	for {
 		conn.SetReadDeadline(time.Now().Add(time.Millisecond))

@@ -4,11 +4,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build ignore
 // +build ignore
 
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"log"
 	"os"
@@ -20,12 +22,19 @@ import (
 )
 
 var trans = make(map[string]string)
-var attrRe = regexp.MustCompile(`\{\{'([^']+)'\s+\|\s+translate\}\}`)
-var attrReCond = regexp.MustCompile(`\{\{.+\s+\?\s+'([^']+)'\s+:\s+'([^']+)'\s+\|\s+translate\}\}`)
+var attrRe = regexp.MustCompile(`\{\{\s*'([^']+)'\s+\|\s+translate\s*\}\}`)
+var attrReCond = regexp.MustCompile(`\{\{.+\s+\?\s+'([^']+)'\s+:\s+'([^']+)'\s+\|\s+translate\s*\}\}`)
+
+// Find both $translate.instant("…") and $translate.instant("…",…) in JS.
+// Consider single quote variants too.
+var jsRe = []*regexp.Regexp{
+	regexp.MustCompile(`\$translate\.instant\(\s*"(.+?)"(,.*|\s*)\)`),
+	regexp.MustCompile(`\$translate\.instant\(\s*'(.+?)'(,.*|\s*)\)`),
+}
 
 // exceptions to the untranslated text warning
 var noStringRe = regexp.MustCompile(
-	`^((\W*\{\{.*?\}\} ?.?\/?.?(bps)?\W*)+(\.stignore)?|[^a-zA-Z]+.?[^a-zA-Z]*|[kMGT]?B|Twitter|JS\W?|DEV|https?://\S+)$`)
+	`^((\W*\{\{.*?\}\} ?.?\/?.?(bps)?\W*)+(\.stignore)?|[^a-zA-Z]+.?[^a-zA-Z]*|[kMGT]?B|Twitter|JS\W?|DEV|https?://\S+|TechUi)$`)
 
 // exceptions to the untranslated text warning specific to aboutModalView.html
 var aboutRe = regexp.MustCompile(`^([^/]+/[^/]+|(The Go Pro|Font Awesome ).+|Build \{\{.+\}\}|Copyright .+ the Syncthing Authors\.)$`)
@@ -35,7 +44,7 @@ func generalNode(n *html.Node, filename string) {
 	if n.Type == html.ElementNode {
 		if n.Data == "translate" { // for <translate>Text</translate>
 			translate = true
-		} else if n.Data == "style" {
+		} else if n.Data == "style" || n.Data == "noscript" {
 			return
 		} else {
 			for _, a := range n.Attr {
@@ -108,20 +117,48 @@ func walkerFor(basePath string) filepath.WalkFunc {
 			return err
 		}
 
-		if filepath.Ext(name) == ".html" && info.Mode().IsRegular() {
-			fd, err := os.Open(name)
-			if err != nil {
-				log.Fatal(err)
-			}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		fd, err := os.Open(name)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer fd.Close()
+		switch filepath.Ext(name) {
+		case ".html":
 			doc, err := html.Parse(fd)
 			if err != nil {
 				log.Fatal(err)
 			}
-			fd.Close()
 			generalNode(doc, filepath.Base(name))
+		case ".js":
+			for s := bufio.NewScanner(fd); s.Scan(); {
+				for _, re := range jsRe {
+					for _, matches := range re.FindAllStringSubmatch(s.Text(), -1) {
+						translation(matches[1])
+					}
+				}
+			}
 		}
 
 		return nil
+	}
+}
+
+func collectThemes(basePath string) {
+	files, err := os.ReadDir(basePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, f := range files {
+		if f.IsDir() {
+			key := "theme-name-" + f.Name()
+			if _, ok := trans[key]; !ok {
+				name := strings.Title(f.Name())
+				trans[key] = name
+			}
+		}
 	}
 }
 
@@ -139,8 +176,9 @@ func main() {
 	var guiDir = os.Args[2]
 
 	filepath.Walk(guiDir, walkerFor(guiDir))
+	collectThemes(guiDir)
 
-	bs, err := json.MarshalIndent(trans, "", "   ")
+	bs, err := json.MarshalIndent(trans, "", "    ")
 	if err != nil {
 		log.Fatal(err)
 	}

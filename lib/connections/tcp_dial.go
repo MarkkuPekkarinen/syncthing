@@ -13,11 +13,10 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/protocol"
 )
-
-const tcpPriority = 10
 
 func init() {
 	factory := &tcpDialerFactory{}
@@ -28,6 +27,7 @@ func init() {
 
 type tcpDialer struct {
 	commonDialer
+	registry *registry.Registry
 }
 
 func (d *tcpDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL) (internalConn, error) {
@@ -35,7 +35,7 @@ func (d *tcpDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL)
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	conn, err := dialer.DialContextReusePort(timeoutCtx, uri.Scheme, uri.Host)
+	conn, err := dialer.DialContextReusePortFunc(d.registry)(timeoutCtx, uri.Scheme, uri.Host)
 	if err != nil {
 		return internalConn{}, err
 	}
@@ -57,21 +57,28 @@ func (d *tcpDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL)
 		return internalConn{}, err
 	}
 
-	return internalConn{tc, connTypeTCPClient, tcpPriority}, nil
+	priority := d.wanPriority
+	isLocal := d.lanChecker.isLAN(conn.RemoteAddr())
+	if isLocal {
+		priority = d.lanPriority
+	}
+	return newInternalConn(tc, connTypeTCPClient, isLocal, priority), nil
 }
 
 type tcpDialerFactory struct{}
 
-func (tcpDialerFactory) New(opts config.OptionsConfiguration, tlsCfg *tls.Config) genericDialer {
-	return &tcpDialer{commonDialer{
-		trafficClass:      opts.TrafficClass,
-		reconnectInterval: time.Duration(opts.ReconnectIntervalS) * time.Second,
-		tlsCfg:            tlsCfg,
-	}}
-}
-
-func (tcpDialerFactory) Priority() int {
-	return tcpPriority
+func (tcpDialerFactory) New(opts config.OptionsConfiguration, tlsCfg *tls.Config, registry *registry.Registry, lanChecker *lanChecker) genericDialer {
+	return &tcpDialer{
+		commonDialer: commonDialer{
+			trafficClass:      opts.TrafficClass,
+			reconnectInterval: time.Duration(opts.ReconnectIntervalS) * time.Second,
+			tlsCfg:            tlsCfg,
+			lanPriority:       opts.ConnectionPriorityTCPLAN,
+			wanPriority:       opts.ConnectionPriorityTCPWAN,
+			lanChecker:        lanChecker,
+		},
+		registry: registry,
+	}
 }
 
 func (tcpDialerFactory) AlwaysWAN() bool {

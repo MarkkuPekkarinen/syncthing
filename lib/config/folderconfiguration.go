@@ -9,12 +9,16 @@ package config
 import (
 	"errors"
 	"fmt"
-	"runtime"
+	"path"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/shirou/gopsutil/disk"
+	"github.com/shirou/gopsutil/v3/disk"
 
+	"github.com/syncthing/syncthing/lib/build"
+	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/util"
@@ -26,22 +30,12 @@ var (
 	ErrMarkerMissing    = errors.New("folder marker missing (this indicates potential data loss, search docs/forum to get information about how to proceed)")
 )
 
-const DefaultMarkerName = ".stfolder"
-
-func NewFolderConfiguration(myID protocol.DeviceID, id, label string, fsType fs.FilesystemType, path string) FolderConfiguration {
-	f := FolderConfiguration{
-		ID:             id,
-		Label:          label,
-		Devices:        []FolderDeviceConfiguration{{DeviceID: myID}},
-		FilesystemType: fsType,
-		Path:           path,
-	}
-
-	util.SetDefaults(&f)
-
-	f.prepare()
-	return f
-}
+const (
+	DefaultMarkerName          = ".stfolder"
+	EncryptionTokenName        = "syncthing-encryption_password_token"
+	maxConcurrentWritesDefault = 2
+	maxConcurrentWritesLimit   = 64
+)
 
 func (f FolderConfiguration) Copy() FolderConfiguration {
 	c := f
@@ -51,31 +45,36 @@ func (f FolderConfiguration) Copy() FolderConfiguration {
 	return c
 }
 
-func (f FolderConfiguration) Filesystem() fs.Filesystem {
+// Filesystem creates a filesystem for the path and options of this folder.
+// The fset parameter may be nil, in which case no mtime handling on top of
+// the filesystem is provided.
+func (f FolderConfiguration) Filesystem(fset *db.FileSet) fs.Filesystem {
 	// This is intentionally not a pointer method, because things like
-	// cfg.Folders["default"].Filesystem() should be valid.
-	var opts []fs.Option
+	// cfg.Folders["default"].Filesystem(nil) should be valid.
+	opts := make([]fs.Option, 0, 3)
 	if f.FilesystemType == fs.FilesystemTypeBasic && f.JunctionsAsDirs {
-		opts = append(opts, fs.WithJunctionsAsDirs())
+		opts = append(opts, new(fs.OptionJunctionsAsDirs))
 	}
-	filesystem := fs.NewFilesystem(f.FilesystemType, f.Path, opts...)
 	if !f.CaseSensitiveFS {
-		filesystem = fs.NewCaseFilesystem(filesystem)
+		opts = append(opts, new(fs.OptionDetectCaseConflicts))
 	}
-	return filesystem
+	if fset != nil {
+		opts = append(opts, fset.MtimeOption())
+	}
+	return fs.NewFilesystem(f.FilesystemType, f.Path, opts...)
 }
 
 func (f FolderConfiguration) ModTimeWindow() time.Duration {
 	dur := time.Duration(f.RawModTimeWindowS) * time.Second
-	if f.RawModTimeWindowS < 1 && runtime.GOOS == "android" {
-		if usage, err := disk.Usage(f.Filesystem().URI()); err != nil {
+	if f.RawModTimeWindowS < 1 && build.IsAndroid {
+		if usage, err := disk.Usage(f.Filesystem(nil).URI()); err != nil {
 			dur = 2 * time.Second
 			l.Debugf(`Detecting FS at "%v" on android: Setting mtime window to 2s: err == "%v"`, f.Path, err)
-		} else if usage.Fstype == "" || strings.Contains(strings.ToLower(usage.Fstype), "fat") {
+		} else if strings.HasPrefix(strings.ToLower(usage.Fstype), "ext2") || strings.HasPrefix(strings.ToLower(usage.Fstype), "ext3") || strings.HasPrefix(strings.ToLower(usage.Fstype), "ext4") {
+			l.Debugf(`Detecting FS at %v on android: Leaving mtime window at 0: usage.Fstype == "%v"`, f.Path, usage.Fstype)
+		} else {
 			dur = 2 * time.Second
 			l.Debugf(`Detecting FS at "%v" on android: Setting mtime window to 2s: usage.Fstype == "%v"`, f.Path, usage.Fstype)
-		} else {
-			l.Debugf(`Detecting FS at %v on android: Leaving mtime window at 0: usage.Fstype == "%v"`, f.Path, usage.Fstype)
 		}
 	}
 	return dur
@@ -92,13 +91,13 @@ func (f *FolderConfiguration) CreateMarker() error {
 		return nil
 	}
 
-	permBits := fs.FileMode(0777)
-	if runtime.GOOS == "windows" {
+	permBits := fs.FileMode(0o777)
+	if build.IsWindows {
 		// Windows has no umask so we must chose a safer set of bits to
 		// begin with.
-		permBits = 0700
+		permBits = 0o700
 	}
-	fs := f.Filesystem()
+	fs := f.Filesystem(nil)
 	err := fs.Mkdir(DefaultMarkerName, permBits)
 	if err != nil {
 		return err
@@ -115,7 +114,11 @@ func (f *FolderConfiguration) CreateMarker() error {
 
 // CheckPath returns nil if the folder root exists and contains the marker file
 func (f *FolderConfiguration) CheckPath() error {
-	fi, err := f.Filesystem().Stat(".")
+	return f.checkFilesystemPath(f.Filesystem(nil), ".")
+}
+
+func (f *FolderConfiguration) checkFilesystemPath(ffs fs.Filesystem, path string) error {
+	fi, err := ffs.Stat(path)
 	if err != nil {
 		if !fs.IsNotExist(err) {
 			return err
@@ -133,7 +136,7 @@ func (f *FolderConfiguration) CheckPath() error {
 		return ErrPathNotDirectory
 	}
 
-	_, err = f.Filesystem().Stat(f.MarkerName)
+	_, err = ffs.Stat(filepath.Join(path, f.MarkerName))
 	if err != nil {
 		if !fs.IsNotExist(err) {
 			return err
@@ -147,14 +150,14 @@ func (f *FolderConfiguration) CheckPath() error {
 func (f *FolderConfiguration) CreateRoot() (err error) {
 	// Directory permission bits. Will be filtered down to something
 	// sane by umask on Unixes.
-	permBits := fs.FileMode(0777)
-	if runtime.GOOS == "windows" {
+	permBits := fs.FileMode(0o777)
+	if build.IsWindows {
 		// Windows has no umask so we must chose a safer set of bits to
 		// begin with.
-		permBits = 0700
+		permBits = 0o700
 	}
 
-	filesystem := f.Filesystem()
+	filesystem := f.Filesystem(nil)
 
 	if _, err = filesystem.Stat("."); fs.IsNotExist(err) {
 		err = filesystem.MkdirAll(".", permBits)
@@ -178,7 +181,21 @@ func (f *FolderConfiguration) DeviceIDs() []protocol.DeviceID {
 	return deviceIDs
 }
 
-func (f *FolderConfiguration) prepare() {
+func (f *FolderConfiguration) prepare(myID protocol.DeviceID, existingDevices map[protocol.DeviceID]*DeviceConfiguration) {
+	// Ensure that
+	// - any loose devices are not present in the wrong places
+	// - there are no duplicate devices
+	// - we are part of the devices
+	// - folder is not shared in trusted mode with an untrusted device
+	f.Devices = ensureExistingDevices(f.Devices, existingDevices)
+	f.Devices = ensureNoDuplicateFolderDevices(f.Devices)
+	f.Devices = ensureDevicePresent(f.Devices, myID)
+	f.Devices = ensureNoUntrustedTrustingSharing(f, f.Devices, existingDevices)
+
+	sort.Slice(f.Devices, func(a, b int) bool {
+		return f.Devices[a].DeviceID.Compare(f.Devices[b].DeviceID) == -1
+	})
+
 	if f.RescanIntervalS > MaxRescanIntervalS {
 		f.RescanIntervalS = MaxRescanIntervalS
 	} else if f.RescanIntervalS < 0 {
@@ -188,11 +205,10 @@ func (f *FolderConfiguration) prepare() {
 	if f.FSWatcherDelayS <= 0 {
 		f.FSWatcherEnabled = false
 		f.FSWatcherDelayS = 10
+	} else if f.FSWatcherDelayS < 0.01 {
+		f.FSWatcherDelayS = 0.01
 	}
 
-	if f.Versioning.Params == nil {
-		f.Versioning.Params = make(map[string]string)
-	}
 	if f.Versioning.CleanupIntervalS > MaxRescanIntervalS {
 		f.Versioning.CleanupIntervalS = MaxRescanIntervalS
 	} else if f.Versioning.CleanupIntervalS < 0 {
@@ -205,6 +221,17 @@ func (f *FolderConfiguration) prepare() {
 
 	if f.MarkerName == "" {
 		f.MarkerName = DefaultMarkerName
+	}
+
+	if f.MaxConcurrentWrites <= 0 {
+		f.MaxConcurrentWrites = maxConcurrentWritesDefault
+	} else if f.MaxConcurrentWrites > maxConcurrentWritesLimit {
+		f.MaxConcurrentWrites = maxConcurrentWritesLimit
+	}
+
+	if f.Type == FolderTypeReceiveEncrypted {
+		f.DisableTempIndexes = true
+		f.IgnorePerms = true
 	}
 }
 
@@ -226,30 +253,53 @@ func (f FolderConfiguration) RequiresRestartOnly() FolderConfiguration {
 	return copy
 }
 
-func (f *FolderConfiguration) SharedWith(device protocol.DeviceID) bool {
+func (f *FolderConfiguration) Device(device protocol.DeviceID) (FolderDeviceConfiguration, bool) {
 	for _, dev := range f.Devices {
 		if dev.DeviceID == device {
-			return true
+			return dev, true
+		}
+	}
+	return FolderDeviceConfiguration{}, false
+}
+
+func (f *FolderConfiguration) SharedWith(device protocol.DeviceID) bool {
+	_, ok := f.Device(device)
+	return ok
+}
+
+func (f *FolderConfiguration) CheckAvailableSpace(req uint64) error {
+	val := f.MinDiskFree.BaseValue()
+	if val <= 0 {
+		return nil
+	}
+	fs := f.Filesystem(nil)
+	usage, err := fs.Usage(".")
+	if err != nil {
+		return nil
+	}
+	if err := checkAvailableSpace(req, f.MinDiskFree, usage); err != nil {
+		return fmt.Errorf("insufficient space in folder %v (%v): %w", f.Description(), fs.URI(), err)
+	}
+	return nil
+}
+
+func (f XattrFilter) Permit(s string) bool {
+	if len(f.Entries) == 0 {
+		return true
+	}
+
+	for _, entry := range f.Entries {
+		if ok, _ := path.Match(entry.Match, s); ok {
+			return entry.Permit
 		}
 	}
 	return false
 }
 
-func (f *FolderConfiguration) CheckAvailableSpace(req int64) error {
-	val := f.MinDiskFree.BaseValue()
-	if val <= 0 {
-		return nil
-	}
-	fs := f.Filesystem()
-	usage, err := fs.Usage(".")
-	if err != nil {
-		return nil
-	}
-	usage.Free -= req
-	if usage.Free > 0 {
-		if err := CheckFreeSpace(f.MinDiskFree, usage); err == nil {
-			return nil
-		}
-	}
-	return fmt.Errorf("insufficient space in %v %v", fs.Type(), fs.URI())
+func (f XattrFilter) GetMaxSingleEntrySize() int {
+	return f.MaxSingleEntrySize
+}
+
+func (f XattrFilter) GetMaxTotalSize() int {
+	return f.MaxTotalSize
 }

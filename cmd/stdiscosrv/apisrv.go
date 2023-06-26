@@ -10,8 +10,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -66,12 +68,12 @@ func newAPISrv(addr string, cert tls.Certificate, db database, repl replicator, 
 	}
 }
 
-func (s *apiSrv) Serve() {
+func (s *apiSrv) Serve(_ context.Context) error {
 	if s.useHTTP {
 		listener, err := net.Listen("tcp", s.addr)
 		if err != nil {
 			log.Println("Listen:", err)
-			return
+			return err
 		}
 		s.listener = listener
 	} else {
@@ -93,7 +95,7 @@ func (s *apiSrv) Serve() {
 		tlsListener, err := tls.Listen("tcp", s.addr, tlsCfg)
 		if err != nil {
 			log.Println("Listen:", err)
-			return
+			return err
 		}
 		s.listener = tlsListener
 	}
@@ -107,9 +109,11 @@ func (s *apiSrv) Serve() {
 		MaxHeaderBytes: httpMaxHeaderBytes,
 	}
 
-	if err := srv.Serve(s.listener); err != nil {
+	err := srv.Serve(s.listener)
+	if err != nil {
 		log.Println("Serve:", err)
 	}
+	return err
 }
 
 var topCtx = context.Background()
@@ -227,10 +231,10 @@ func (s *apiSrv) handleGET(ctx context.Context, w http.ResponseWriter, req *http
 func (s *apiSrv) handlePOST(ctx context.Context, remoteAddr *net.TCPAddr, w http.ResponseWriter, req *http.Request) {
 	reqID := ctx.Value(idKey).(requestID)
 
-	rawCert := certificateBytes(req)
-	if rawCert == nil {
+	rawCert, err := certificateBytes(req)
+	if err != nil {
 		if debug {
-			log.Println(reqID, "no certificates")
+			log.Println(reqID, "no certificates:", err)
 		}
 		announceRequestsTotal.WithLabelValues("no_certificate").Inc()
 		w.Header().Set("Retry-After", errorRetryAfterString())
@@ -298,13 +302,13 @@ func (s *apiSrv) handleAnnounce(deviceID protocol.DeviceID, addresses []string) 
 	return s.db.merge(key, dbAddrs, seen)
 }
 
-func handlePing(w http.ResponseWriter, r *http.Request) {
+func handlePing(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(204)
 }
 
-func certificateBytes(req *http.Request) []byte {
+func certificateBytes(req *http.Request) ([]byte, error) {
 	if req.TLS != nil && len(req.TLS.PeerCertificates) > 0 {
-		return req.TLS.PeerCertificates[0].Raw
+		return req.TLS.PeerCertificates[0].Raw, nil
 	}
 
 	var bs []byte
@@ -317,7 +321,7 @@ func certificateBytes(req *http.Request) []byte {
 			hdr, err := url.QueryUnescape(hdr)
 			if err != nil {
 				// Decoding failed
-				return nil
+				return nil, err
 			}
 
 			bs = []byte(hdr)
@@ -336,6 +340,15 @@ func certificateBytes(req *http.Request) []byte {
 				}
 			}
 		}
+	} else if hdr := req.Header.Get("X-Tls-Client-Cert-Der-Base64"); hdr != "" {
+		// Caddy {tls_client_certificate_der_base64}
+		hdr, err := base64.StdEncoding.DecodeString(hdr)
+		if err != nil {
+			// Decoding failed
+			return nil, err
+		}
+
+		bs = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: hdr})
 	} else if hdr := req.Header.Get("X-Forwarded-Tls-Client-Cert"); hdr != "" {
 		// Traefik 2 passtlsclientcert
 		// The certificate is in PEM format with url encoding but without newlines
@@ -344,7 +357,7 @@ func certificateBytes(req *http.Request) []byte {
 		hdr, err := url.QueryUnescape(hdr)
 		if err != nil {
 			// Decoding failed
-			return nil
+			return nil, err
 		}
 
 		for i := 64; i < len(hdr); i += 65 {
@@ -357,16 +370,16 @@ func certificateBytes(req *http.Request) []byte {
 	}
 
 	if bs == nil {
-		return nil
+		return nil, errors.New("empty certificate header")
 	}
 
 	block, _ := pem.Decode(bs)
 	if block == nil {
 		// Decoding failed
-		return nil
+		return nil, errors.New("certificate decode result is empty")
 	}
 
-	return block.Bytes
+	return block.Bytes, nil
 }
 
 // fixupAddresses checks the list of addresses, removing invalid ones and
@@ -417,7 +430,7 @@ func fixupAddresses(remote *net.TCPAddr, addresses []string) []string {
 
 			// If zero port was specified, use remote port.
 			if port == "0" && remote.Port > 0 {
-				port = fmt.Sprintf("%d", remote.Port)
+				port = strconv.Itoa(remote.Port)
 			}
 		}
 

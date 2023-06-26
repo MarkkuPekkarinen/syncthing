@@ -1,5 +1,6 @@
 // Copyright (C) 2014 The Protocol Authors.
 
+//go:build windows
 // +build windows
 
 package protocol
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+func makeNative(m Model) Model { return nativeModel{m} }
 
 type nativeModel struct {
 	Model
@@ -26,14 +29,14 @@ func (m nativeModel) IndexUpdate(deviceID DeviceID, folder string, files []FileI
 	return m.Model.IndexUpdate(deviceID, folder, files)
 }
 
-func (m nativeModel) Request(deviceID DeviceID, folder, name string, size int32, offset int64, hash []byte, weakHash uint32, fromTemporary bool) (RequestResponse, error) {
+func (m nativeModel) Request(deviceID DeviceID, folder, name string, blockNo, size int32, offset int64, hash []byte, weakHash uint32, fromTemporary bool) (RequestResponse, error) {
 	if strings.Contains(name, `\`) {
 		l.Warnf("Dropping request for %s, contains invalid path separator", name)
 		return nil, ErrNoSuchFile
 	}
 
 	name = filepath.FromSlash(name)
-	return m.Model.Request(deviceID, folder, name, size, offset, hash, weakHash, fromTemporary)
+	return m.Model.Request(deviceID, folder, name, blockNo, size, offset, hash, weakHash, fromTemporary)
 }
 
 func fixupFiles(files []FileInfo) []FileInfo {

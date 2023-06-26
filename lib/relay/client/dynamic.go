@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/osutil"
@@ -25,10 +26,11 @@ type dynamicClient struct {
 	certs    []tls.Certificate
 	timeout  time.Duration
 
-	client RelayClient
+	mut    sync.RWMutex // Protects client.
+	client *staticClient
 }
 
-func newDynamicClient(uri *url.URL, certs []tls.Certificate, invitations chan protocol.SessionInvitation, timeout time.Duration) RelayClient {
+func newDynamicClient(uri *url.URL, certs []tls.Certificate, invitations chan protocol.SessionInvitation, timeout time.Duration) *dynamicClient {
 	c := &dynamicClient{
 		pooladdr: uri,
 		certs:    certs,
@@ -46,12 +48,11 @@ func (c *dynamicClient) serve(ctx context.Context) error {
 
 	l.Debugln(c, "looking up dynamic relays")
 
-	req, err := http.NewRequest("GET", uri.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", uri.String(), nil)
 	if err != nil {
 		l.Debugln(c, "failed to lookup dynamic relays", err)
 		return err
 	}
-	req.Cancel = ctx.Done()
 	data, err := http.DefaultClient.Do(req)
 	if err != nil {
 		l.Debugln(c, "failed to lookup dynamic relays", err)
@@ -93,7 +94,8 @@ func (c *dynamicClient) serve(ctx context.Context) error {
 			c.client = client
 			c.mut.Unlock()
 
-			c.client.Serve()
+			err = c.client.Serve(ctx)
+			l.Debugf("Disconnected from %s://%s: %v", c.client.URI().Scheme, c.client.URI().Host, err)
 
 			c.mut.Lock()
 			c.client = nil
@@ -104,15 +106,6 @@ func (c *dynamicClient) serve(ctx context.Context) error {
 	return errors.New("could not find a connectable relay")
 }
 
-func (c *dynamicClient) Stop() {
-	c.mut.RLock()
-	if c.client != nil {
-		c.client.Stop()
-	}
-	c.mut.RUnlock()
-	c.commonClient.Stop()
-}
-
 func (c *dynamicClient) Error() error {
 	c.mut.RLock()
 	defer c.mut.RUnlock()
@@ -120,15 +113,6 @@ func (c *dynamicClient) Error() error {
 		return c.commonClient.Error()
 	}
 	return c.client.Error()
-}
-
-func (c *dynamicClient) Latency() time.Duration {
-	c.mut.RLock()
-	defer c.mut.RUnlock()
-	if c.client == nil {
-		return time.Hour
-	}
-	return c.client.Latency()
 }
 
 func (c *dynamicClient) String() string {

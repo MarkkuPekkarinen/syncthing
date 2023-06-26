@@ -4,7 +4,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//+build ignore
+//go:build ignore
+// +build ignore
 
 package main
 
@@ -25,10 +26,7 @@ import (
 
 // Inception, go generate calls the script itself that then deals with generation.
 // This is only done because go:generate does not support wildcards in paths.
-//go:generate go run generate.go lib/config lib/fs
-
-// Use the standard compiler here. We can revisit this later, but we don't plan on exposing this via any APIs.
-//go:generate protoc -I ../ -I . --gogofast_out=paths=source_relative:.. lib/protocol/bep.proto
+//go:generate go run generate.go lib/protocol lib/config lib/fs lib/db lib/discover
 
 func main() {
 	for _, path := range os.Args[1:] {

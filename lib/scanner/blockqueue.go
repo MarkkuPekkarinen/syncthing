@@ -63,7 +63,6 @@ func HashFile(ctx context.Context, fs fs.Filesystem, path string, blockSize int,
 // is closed and all items handled.
 type parallelHasher struct {
 	fs      fs.Filesystem
-	workers int
 	outbox  chan<- ScanResult
 	inbox   <-chan protocol.FileInfo
 	counter Counter
@@ -74,7 +73,6 @@ type parallelHasher struct {
 func newParallelHasher(ctx context.Context, fs fs.Filesystem, workers int, outbox chan<- ScanResult, inbox <-chan protocol.FileInfo, counter Counter, done chan<- struct{}) {
 	ph := &parallelHasher{
 		fs:      fs,
-		workers: workers,
 		outbox:  outbox,
 		inbox:   inbox,
 		counter: counter,
@@ -82,8 +80,8 @@ func newParallelHasher(ctx context.Context, fs fs.Filesystem, workers int, outbo
 		wg:      sync.NewWaitGroup(),
 	}
 
+	ph.wg.Add(workers)
 	for i := 0; i < workers; i++ {
-		ph.wg.Add(1)
 		go ph.hashFiles(ctx)
 	}
 
@@ -100,13 +98,15 @@ func (ph *parallelHasher) hashFiles(ctx context.Context) {
 				return
 			}
 
+			l.Debugln("started hashing:", f)
+
 			if f.IsDirectory() || f.IsDeleted() {
 				panic("Bug. Asked to hash a directory or a deleted file.")
 			}
 
 			blocks, err := HashFile(ctx, ph.fs, f.Name, f.BlockSize(), ph.counter, true)
 			if err != nil {
-				l.Debugln("hash error:", f.Name, err)
+				handleError(ctx, "hashing", f.Name, err, ph.outbox)
 				continue
 			}
 
@@ -122,6 +122,7 @@ func (ph *parallelHasher) hashFiles(ctx context.Context) {
 				f.Size += int64(b.Size)
 			}
 
+			l.Debugln("completed hashing:", f)
 			select {
 			case ph.outbox <- ScanResult{File: f}:
 			case <-ctx.Done():
@@ -136,6 +137,10 @@ func (ph *parallelHasher) hashFiles(ctx context.Context) {
 
 func (ph *parallelHasher) closeWhenDone() {
 	ph.wg.Wait()
+	// In case the hasher aborted on context, wait for filesystem
+	// walking/progress routine to finish.
+	for range ph.inbox {
+	}
 	if ph.done != nil {
 		close(ph.done)
 	}

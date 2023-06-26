@@ -7,9 +7,7 @@
 package syncthing
 
 import (
-	"io/ioutil"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -17,12 +15,13 @@ import (
 	"github.com/syncthing/syncthing/lib/db/backend"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/svcutil"
 	"github.com/syncthing/syncthing/lib/tlsutil"
 )
 
 func tempCfgFilename(t *testing.T) string {
 	t.Helper()
-	f, err := ioutil.TempFile("", "syncthing-testConfig-")
+	f, err := os.CreateTemp("", "syncthing-testConfig-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +35,7 @@ func TestShortIDCheck(t *testing.T) {
 			{DeviceID: protocol.DeviceID{8, 16, 24, 32, 40, 48, 56, 0, 0}},
 			{DeviceID: protocol.DeviceID{8, 16, 24, 32, 40, 48, 56, 1, 1}}, // first 56 bits same, differ in the first 64 bits
 		},
-	}, events.NoopLogger)
+	}, protocol.LocalDeviceID, events.NoopLogger)
 	defer os.Remove(cfg.ConfigPath())
 
 	if err := checkShortIDs(cfg); err != nil {
@@ -48,7 +47,7 @@ func TestShortIDCheck(t *testing.T) {
 			{DeviceID: protocol.DeviceID{8, 16, 24, 32, 40, 48, 56, 64, 0}},
 			{DeviceID: protocol.DeviceID{8, 16, 24, 32, 40, 48, 56, 64, 1}}, // first 64 bits same
 		},
-	}, events.NoopLogger)
+	}, protocol.LocalDeviceID, events.NoopLogger)
 
 	if err := checkShortIDs(cfg); err == nil {
 		t.Error("Should have gotten an error")
@@ -56,13 +55,7 @@ func TestShortIDCheck(t *testing.T) {
 }
 
 func TestStartupFail(t *testing.T) {
-	tmpDir, err := ioutil.TempDir("", "syncthing-TestStartupFail-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	cert, err := tlsutil.NewCertificate(filepath.Join(tmpDir, "cert"), filepath.Join(tmpDir, "key"), "syncthing", 365)
+	cert, err := tlsutil.NewCertificateInMemory("syncthing", 365)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,18 +68,21 @@ func TestStartupFail(t *testing.T) {
 			{DeviceID: id},
 			{DeviceID: conflID},
 		},
-	}, events.NoopLogger)
+	}, protocol.LocalDeviceID, events.NoopLogger)
 	defer os.Remove(cfg.ConfigPath())
 
 	db := backend.OpenMemory()
-	app := New(cfg, db, events.NoopLogger, cert, Options{})
+	app, err := New(cfg, db, events.NoopLogger, cert, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	startErr := app.Start()
 	if startErr == nil {
 		t.Fatal("Expected an error from Start, got nil")
 	}
 
 	done := make(chan struct{})
-	var waitE ExitStatus
+	var waitE svcutil.ExitStatus
 	go func() {
 		waitE = app.Wait()
 		close(done)
@@ -98,8 +94,8 @@ func TestStartupFail(t *testing.T) {
 	case <-done:
 	}
 
-	if waitE != ExitError {
-		t.Errorf("Got exit status %v, expected %v", waitE, ExitError)
+	if waitE != svcutil.ExitError {
+		t.Errorf("Got exit status %v, expected %v", waitE, svcutil.ExitError)
 	}
 
 	if err = app.Error(); err != startErr {

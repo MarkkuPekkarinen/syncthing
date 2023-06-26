@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package osutil
 
@@ -10,19 +10,42 @@ import (
 	"net"
 )
 
-func interfaceAddresses(network string, intf *net.Interface) []string {
-	var out []string
-	addrs, err := intf.Addrs()
+func GetLans() ([]*net.IPNet, error) {
+	ifs, err := net.Interfaces()
 	if err != nil {
-		return out
+		return nil, err
 	}
+	addrs := []net.Addr{}
+	for _, currentIf := range ifs {
+		if currentIf.Flags&net.FlagUp != net.FlagUp {
+			continue
+		}
+		currentAddrs, err := currentIf.Addrs()
+		if err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, currentAddrs...)
+	}
+
+	nets := make([]*net.IPNet, 0, len(addrs))
 
 	for _, addr := range addrs {
-		ipnet, ok := addr.(*net.IPNet)
-		if ok && (network == "tcp" || (network == "tcp4" && len(ipnet.IP) == net.IPv4len) || (network == "tcp6" && len(ipnet.IP) == net.IPv6len)) {
-			out = append(out, ipnet.IP.String())
+		net, ok := addr.(*net.IPNet)
+		if ok {
+			nets = append(nets, net)
 		}
 	}
+	return nets, nil
+}
 
-	return out
+func IPFromAddr(addr net.Addr) (net.IP, error) {
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		return a.IP, nil
+	case *net.UDPAddr:
+		return a.IP, nil
+	default:
+		host, _, err := net.SplitHostPort(addr.String())
+		return net.ParseIP(host), err
+	}
 }
