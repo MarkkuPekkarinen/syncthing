@@ -18,7 +18,6 @@ import (
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/sync"
 )
 
 var timeout = 100 * time.Millisecond
@@ -39,7 +38,7 @@ func expectEvent(w events.Subscription, t *testing.T, size int) {
 	if event.Type != events.DownloadProgress {
 		t.Fatal("Unexpected event:", event, "at", caller(1))
 	}
-	data := event.Data.(map[string]map[string]*pullerProgress)
+	data := event.Data.(map[string]map[string]*PullerProgress)
 	if len(data) != size {
 		t.Fatal("Unexpected event data size:", data, "at", caller(1))
 	}
@@ -79,7 +78,6 @@ func TestProgressEmitter(t *testing.T) {
 
 	s := sharedPullerState{
 		updated: time.Now(),
-		mut:     sync.NewRWMutex(),
 	}
 	p.Register(&s)
 
@@ -91,7 +89,7 @@ func TestProgressEmitter(t *testing.T) {
 	expectEvent(w, t, 1)
 	expectTimeout(w, t)
 
-	s.copiedFromOrigin()
+	s.copiedFromOrigin(1)
 
 	expectEvent(w, t, 1)
 	expectTimeout(w, t)
@@ -222,7 +220,6 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 			Version: v1,
 			Blocks:  blocks,
 		},
-		mut:              sync.NewRWMutex(),
 		availableUpdated: time.Now(),
 	}
 	p.registry["folder"]["1"] = state1
@@ -305,7 +302,6 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 			Version: v1,
 			Blocks:  blocks,
 		},
-		mut:              sync.NewRWMutex(),
 		available:        []int{1, 2, 3},
 		availableUpdated: time.Now(),
 	}
@@ -316,7 +312,6 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 			Version: v1,
 			Blocks:  blocks,
 		},
-		mut:              sync.NewRWMutex(),
 		available:        []int{1, 2, 3},
 		availableUpdated: time.Now(),
 	}
@@ -327,7 +322,6 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 			Version: v1,
 			Blocks:  blocks,
 		},
-		mut:              sync.NewRWMutex(),
 		available:        []int{1, 2, 3},
 		availableUpdated: time.Now(),
 	}
@@ -375,7 +369,6 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 			Type:    protocol.FileInfoTypeDirectory,
 			Blocks:  blocks,
 		},
-		mut:              sync.NewRWMutex(),
 		available:        []int{1, 2, 3},
 		availableUpdated: time.Now(),
 	}
@@ -387,7 +380,6 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 			Version: v1,
 			Type:    protocol.FileInfoTypeSymlink,
 		},
-		mut:              sync.NewRWMutex(),
 		available:        []int{1, 2, 3},
 		availableUpdated: time.Now(),
 	}
@@ -399,7 +391,6 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 			Version: v1,
 			Blocks:  blocks,
 		},
-		mut:              sync.NewRWMutex(),
 		available:        []int{1, 2, 3},
 		availableUpdated: time.Now(),
 	}
@@ -411,7 +402,6 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 			Version: v1,
 			Blocks:  blocks[:3],
 		},
-		mut:              sync.NewRWMutex(),
 		available:        []int{1, 2, 3},
 		availableUpdated: time.Now(),
 	}
@@ -463,7 +453,7 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 	p.temporaryIndexUnsubscribe(fc)
 
 	sendMsgs(p)
-	_, ok := p.sentDownloadStates[fc.ID()]
+	_, ok := p.sentDownloadStates[fc.DeviceID()]
 	if ok {
 		t.Error("Should not be there")
 	}

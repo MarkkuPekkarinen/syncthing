@@ -7,9 +7,12 @@
 package versioner
 
 import (
+	"log/slog"
 	"path/filepath"
-	"sort"
+	"slices"
+	"strings"
 
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/fs"
 )
 
@@ -32,11 +35,14 @@ func (t emptyDirTracker) addFile(path string) {
 }
 
 func (t emptyDirTracker) emptyDirs() []string {
-	empty := []string{}
+	var empty []string
+
 	for dir := range t {
 		empty = append(empty, dir)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(empty)))
+	slices.SortFunc(empty, func(a, b string) int {
+		return strings.Compare(b, a)
+	})
 	return empty
 }
 
@@ -45,7 +51,7 @@ func (t emptyDirTracker) deleteEmptyDirs(fs fs.Filesystem) {
 		l.Debugln("Cleaner: deleting empty directory", path)
 		err := fs.Remove(path)
 		if err != nil {
-			l.Warnln("Versioner: can't remove directory", path, err)
+			slog.Warn("Failed to remove versioned directory", slogutil.FilePath(path), slogutil.Error(err))
 		}
 	}
 }

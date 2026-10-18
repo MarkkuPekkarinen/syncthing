@@ -1,3 +1,4 @@
+'\" t
 .\" Man page generated from reStructuredText.
 .
 .
@@ -27,7 +28,7 @@ level margin: \\n[rst2man-indent\\n[rst2man-indent-level]]
 .\" new: \\n[rst2man-indent\\n[rst2man-indent-level]]
 .in \\n[rst2man-indent\\n[rst2man-indent-level]]u
 ..
-.TH "SYNCTHING-RELAY" "7" "Jun 12, 2023" "v1.23.5" "Syncthing"
+.TH "SYNCTHING-RELAY" "7" "Oct 07, 2026" "v2.1.0" "Syncthing"
 .SH NAME
 syncthing-relay \- Relay Protocol v1
 .SH WHAT IS A RELAY?
@@ -104,8 +105,9 @@ If the client fails to send a message (even if it’s a ping message) every minu
 .SS Temporary protocol submode
 .sp
 A temporary protocol submode begins with ConnectRequest message, to which the
-relay responds with either ResponseNotFound if the device the client it is after
-is not available, or with a SessionInvitation, which contains the unique session
+relay responds with ResponseNotFound if the device the client it is after
+is not available, with a RelayFull if the relay has reached its limits,
+or with a SessionInvitation, which contains the unique session
 key which then can be used to establish a connection in session mode.
 .sp
 The connection is terminated immediately after that.
@@ -114,9 +116,8 @@ The connection is terminated immediately after that.
 Client A \- Permanent protocol submode
 Client B \- Temporary protocol submode
 .TS
-center;
-|l|l|l|l|.
-_
+box center;
+l|l|l|l.
 T{
 #
 T}	T{
@@ -222,14 +223,13 @@ T}	T{
 <\-Pong
 T}	T{
 T}
-_
 .TE
 .SH SESSION MODE
 .sp
 The first and only message the client sends in the session mode is the
 JoinSessionRequest message which contains the session key identifying which
 session you are trying to join. The relay responds with one of the following
-Response messages:
+messages:
 .INDENT 0.0
 .IP 1. 3
 ResponseNotFound \- Session key is invalid
@@ -237,18 +237,23 @@ ResponseNotFound \- Session key is invalid
 ResponseAlreadyConnected \- Session is full (both sides already connected)
 .IP 3. 3
 ResponseSuccess \- You have successfully joined the session
+.IP 4. 3
+RelayFull \- Relay limits are too strict for you to be able to join the session.
+The relay immediately terminates the connection after sending this.
 .UNINDENT
 .sp
 After the successful response, all the bytes written and received will be
 relayed between the two devices in the session directly.
 .SS Example Exchange
 .sp
-Client A \- Permanent protocol mode
-Client B \- Temporary protocol mode
+Client A is the first to join the session.
+.sp
+Client B is the second to join the session.
+.sp
+Both are in session mode.
 .TS
-center;
-|l|l|l|l|.
-_
+box center;
+l|l|l|l.
 T{
 #
 T}	T{
@@ -333,7 +338,6 @@ T}	T{
 T}	T{
 <\-Data
 T}
-_
 .TE
 .SH MESSAGES
 .sp
@@ -351,8 +355,7 @@ us to identify what type of message it is.
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
+.EX
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+
@@ -369,16 +372,14 @@ struct Header {
         int MessageType;
         int MessageLength;
 }
-.ft P
-.fi
+.EE
 .UNINDENT
 .UNINDENT
 .SS Ping message (Type = 0)
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
+.EX
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+
@@ -386,16 +387,14 @@ struct Header {
 
 struct Ping {
 }
-.ft P
-.fi
+.EE
 .UNINDENT
 .UNINDENT
 .SS Pong message (Type = 1)
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
+.EX
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+
@@ -403,16 +402,14 @@ struct Ping {
 
 struct Pong {
 }
-.ft P
-.fi
+.EE
 .UNINDENT
 .UNINDENT
 .SS JoinRelayRequest message (Type = 2)
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
+.EX
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+
@@ -420,16 +417,14 @@ struct Pong {
 
 struct JoinRelayRequest {
 }
-.ft P
-.fi
+.EE
 .UNINDENT
 .UNINDENT
 .SS JoinSessionRequest message (Type = 3)
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
+.EX
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+
@@ -444,8 +439,7 @@ struct JoinRelayRequest {
 struct JoinSessionRequest {
         opaque Key<32>;
 }
-.ft P
-.fi
+.EE
 .UNINDENT
 .UNINDENT
 .INDENT 0.0
@@ -458,8 +452,7 @@ used to identify which session you are trying to connect to.
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
+.EX
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+
@@ -477,8 +470,7 @@ struct Response {
         int Code;
         string Message<>;
 }
-.ft P
-.fi
+.EE
 .UNINDENT
 .UNINDENT
 .INDENT 0.0
@@ -489,12 +481,23 @@ An integer representing the status code.
 .B : Message
 Message associated with the code.
 .UNINDENT
+.INDENT 0.0
+.INDENT 3.5
+.sp
+.EX
+ResponseSuccess           = Response{0, \(dqsuccess\(dq}
+ResponseNotFound          = Response{1, \(dqnot found\(dq}
+ResponseAlreadyConnected  = Response{2, \(dqalready connected\(dq}
+ResponseInternalError     = Response{99, \(dqinternal error\(dq}
+ResponseUnexpectedMessage = Response{100, \(dqunexpected message\(dq}
+.EE
+.UNINDENT
+.UNINDENT
 .SS ConnectRequest message (Type = 5)
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
+.EX
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+
@@ -509,8 +512,7 @@ Message associated with the code.
 struct ConnectRequest {
         opaque ID<32>;
 }
-.ft P
-.fi
+.EE
 .UNINDENT
 .UNINDENT
 .INDENT 0.0
@@ -522,8 +524,7 @@ Device ID to which the client would like to connect.
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
+.EX
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+
@@ -558,8 +559,7 @@ struct SessionInvitation {
         unsigned int Port;
         bool ServerSocket;
 }
-.ft P
-.fi
+.EE
 .UNINDENT
 .UNINDENT
 .INDENT 0.0
@@ -589,6 +589,21 @@ connection this client should assume it’s getting. The value is inverted in
 the invitation which is sent to the other device, so that there is always
 one client socket, and one server socket.
 .UNINDENT
+.SS RelayFull message (Type = 7)
+.INDENT 0.0
+.INDENT 3.5
+.sp
+.EX
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+\-+
+
+
+struct RelayFull {
+}
+.EE
+.UNINDENT
+.UNINDENT
 .SH HOW SYNCTHING USES RELAYS, AND GENERAL SECURITY
 .sp
 In the case of Syncthing and BEP, when two devices connect via relay, they
@@ -615,9 +630,8 @@ performing device ID validation, and full TLS encryption, and provides the same
 security properties as it would provide when connecting over the internet.
 .SH EXAMPLES OF STRONG CIPHER SUITES
 .TS
-center;
-|l|l|l|.
-_
+box center;
+l|l|l.
 T{
 ID
 T}	T{
@@ -689,11 +703,10 @@ ECDHE\-RSA\-AES128\-SHA256
 T}	T{
 TLSv1.2 ECDH RSA AES(128) SHA256
 T}
-_
 .TE
 .SH AUTHOR
 The Syncthing Authors
 .SH COPYRIGHT
-2014-2019, The Syncthing Authors
+2014-2026, The Syncthing Authors
 .\" Generated by docutils manpage writer.
 .

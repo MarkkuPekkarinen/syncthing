@@ -4,8 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:build !noupgrade
-// +build !noupgrade
+//go:build !noupgrade && !ios
 
 package upgrade
 
@@ -14,22 +13,24 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
-	"crypto/tls"
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/syncthing/syncthing/lib/dialer"
+	"github.com/shirou/gopsutil/v4/host"
+	"github.com/syncthing/syncthing/internal/slogutil"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/signature"
+	"github.com/syncthing/syncthing/lib/tlsutil"
 )
 
 const DisabledByCompilation = false
@@ -59,51 +60,53 @@ const (
 	maxMetadataSize = 10 << 20 // 10 MiB
 )
 
-// This is an HTTP/HTTPS client that does *not* perform certificate
-// validation. We do this because some systems where Syncthing runs have
-// issues with old or missing CA roots. It doesn't actually matter that we
-// load the upgrade insecurely as we verify an ECDSA signature of the actual
-// binary contents before accepting the upgrade.
-var insecureHTTP = &http.Client{
-	Timeout: readTimeout,
-	Transport: &http.Transport{
-		DialContext: dialer.DialContext,
-		Proxy:       http.ProxyFromEnvironment,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-	},
+var osVersion string
+
+func init() {
+	osVersion, _ = host.KernelVersion()
+	osVersion = strings.TrimSpace(osVersion)
 }
 
-func insecureGet(url, version string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
+func upgradeClientGet(url string) (*http.Response, context.CancelFunc, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
 
-	req.Header.Set("User-Agent", fmt.Sprintf(`syncthing %s (%s %s-%s)`, version, runtime.Version(), runtime.GOOS, runtime.GOARCH))
-	return insecureHTTP.Do(req)
+	req.Header.Set("User-Agent", build.UserAgent())
+	if osVersion != "" {
+		req.Header.Set("Syncthing-Os-Version", osVersion)
+	}
+	resp, err := tlsutil.ShortLivedHTTPClient.Do(req)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return resp, cancel, nil
 }
 
 // FetchLatestReleases returns the latest releases. The "current" parameter
 // is used for setting the User-Agent only.
 func FetchLatestReleases(releasesURL, current string) []Release {
-	resp, err := insecureGet(releasesURL, current)
+	resp, cancel, err := upgradeClientGet(releasesURL)
 	if err != nil {
-		l.Infoln("Couldn't fetch release information:", err)
+		slog.Warn("Failed to fetch latest release information", slogutil.Error(err))
 		return nil
 	}
+	defer cancel()
+	defer resp.Body.Close()
 	if resp.StatusCode > 299 {
-		l.Infoln("API call returned HTTP error:", resp.Status)
+		slog.Warn("Failed to fetch latest release information", slogutil.Error(resp.Status))
 		return nil
 	}
 
 	var rels []Release
 	err = json.NewDecoder(io.LimitReader(resp.Body, maxMetadataSize)).Decode(&rels)
 	if err != nil {
-		l.Infoln("Fetching release information:", err)
+		slog.Warn("Failed to decode latest release information", slogutil.Error(err))
 	}
-	resp.Body.Close()
 
 	return rels
 }
@@ -113,9 +116,11 @@ type SortByRelease []Release
 func (s SortByRelease) Len() int {
 	return len(s)
 }
+
 func (s SortByRelease) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
+
 func (s SortByRelease) Less(i, j int) bool {
 	return CompareVersions(s[i].Tag, s[j].Tag) > 0
 }
@@ -212,13 +217,16 @@ func upgradeToURL(archiveName, binary string, url string) error {
 func readRelease(archiveName, dir, url string) (string, error) {
 	l.Debugf("loading %q", url)
 
-	req, err := http.NewRequest("GET", url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
 
 	req.Header.Add("Accept", "application/octet-stream")
-	resp, err := insecureHTTP.Do(req)
+	req.Header.Set("User-Agent", build.UserAgent())
+	resp, err := tlsutil.ShortLivedHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -244,15 +252,9 @@ func readTarGz(archiveName, dir string, r io.Reader) (string, error) {
 	var sig []byte
 
 	// Iterate through the files in the archive.
-	i := 0
-	for {
-		if i >= maxArchiveMembers {
-			break
-		}
-		i++
-
+	for range maxArchiveMembers {
 		hdr, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			// end of tar archive
 			break
 		}
@@ -423,7 +425,7 @@ func writeBinary(dir string, inFile io.Reader) (filename string, err error) {
 		return "", err
 	}
 
-	err = os.Chmod(outFile.Name(), os.FileMode(0755))
+	err = os.Chmod(outFile.Name(), os.FileMode(0o755))
 	if err != nil {
 		os.Remove(outFile.Name())
 		return "", err

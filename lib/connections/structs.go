@@ -11,9 +11,12 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"time"
+
+	"github.com/thejerf/suture/v4"
 
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/connections/registry"
@@ -21,8 +24,6 @@ import (
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/stats"
-
-	"github.com/thejerf/suture/v4"
 )
 
 type tlsConn interface {
@@ -38,10 +39,12 @@ type tlsConn interface {
 // came from (type, priority).
 type internalConn struct {
 	tlsConn
+
 	connType      connType
 	isLocal       bool
 	priority      int
 	establishedAt time.Time
+	connectionID  string // set after Hello exchange
 }
 
 type connType int
@@ -88,12 +91,13 @@ func (t connType) Transport() string {
 }
 
 func newInternalConn(tc tlsConn, connType connType, isLocal bool, priority int) internalConn {
+	now := time.Now()
 	return internalConn{
 		tlsConn:       tc,
 		connType:      connType,
 		isLocal:       isLocal,
 		priority:      priority,
-		establishedAt: time.Now().Truncate(time.Second),
+		establishedAt: now.Truncate(time.Second),
 	}
 }
 
@@ -124,7 +128,7 @@ func (c internalConn) Crypto() string {
 
 func (c internalConn) Transport() string {
 	transport := c.connType.Transport()
-	ip, err := osutil.IPFromAddr(c.LocalAddr())
+	ip, err := osutil.IPFromAddr(c.RemoteAddr())
 	if err != nil {
 		return transport
 	}
@@ -138,12 +142,20 @@ func (c internalConn) EstablishedAt() time.Time {
 	return c.establishedAt
 }
 
+func (c internalConn) ConnectionID() string {
+	return c.connectionID
+}
+
 func (c internalConn) String() string {
 	t := "WAN"
 	if c.isLocal {
 		t = "LAN"
 	}
-	return fmt.Sprintf("%s-%s/%s/%s/%s-P%d", c.LocalAddr(), c.RemoteAddr(), c.Type(), c.Crypto(), t, c.Priority())
+	return fmt.Sprintf("%s-%s/%s/%s/%s-P%d-%s", c.LocalAddr(), c.RemoteAddr(), c.Type(), c.Crypto(), t, c.Priority(), c.connectionID)
+}
+
+func (c internalConn) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("local", c.LocalAddr().String()), slog.String("remote", c.RemoteAddr().String()), slog.String("type", c.Type()), slog.Bool("lan", c.isLocal), slog.String("crypto", c.Crypto()), slog.Int("prio", c.priority), slog.String("id", c.ConnectionID()))
 }
 
 type dialerFactory interface {
@@ -160,6 +172,7 @@ type commonDialer struct {
 	lanChecker        *lanChecker
 	lanPriority       int
 	wanPriority       int
+	allowsMultiConns  bool
 }
 
 func (d *commonDialer) RedialFrequency() time.Duration {
@@ -173,10 +186,15 @@ func (d *commonDialer) Priority(host string) int {
 	return d.wanPriority
 }
 
+func (d *commonDialer) AllowsMultiConns() bool {
+	return d.allowsMultiConns
+}
+
 type genericDialer interface {
 	Dial(context.Context, protocol.DeviceID, *url.URL) (internalConn, error)
 	RedialFrequency() time.Duration
 	Priority(host string) int
+	AllowsMultiConns() bool
 }
 
 type listenerFactory interface {
@@ -212,10 +230,7 @@ type genericListener interface {
 type Model interface {
 	protocol.Model
 	AddConnection(conn protocol.Connection, hello protocol.Hello)
-	NumConnections() int
-	Connection(remoteID protocol.DeviceID) (protocol.Connection, bool)
 	OnHello(protocol.DeviceID, net.Addr, protocol.Hello) error
-	GetHello(protocol.DeviceID) protocol.HelloIntf
 	DeviceStatistics() (map[protocol.DeviceID]stats.DeviceStatistics, error)
 }
 

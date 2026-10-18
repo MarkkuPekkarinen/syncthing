@@ -12,14 +12,13 @@ import (
 	"time"
 
 	syncthingprotocol "github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/tlsutil"
-
 	"github.com/syncthing/syncthing/lib/relay/protocol"
+	"github.com/syncthing/syncthing/lib/tlsutil"
 )
 
 var (
 	outboxesMut    = sync.RWMutex{}
-	outboxes       = make(map[syncthingprotocol.DeviceID]chan interface{})
+	outboxes       = make(map[syncthingprotocol.DeviceID]chan any)
 	numConnections atomic.Int64
 )
 
@@ -36,8 +35,14 @@ func listener(_, addr string, config *tls.Config, token string) {
 	for {
 		conn, isTLS, err := listener.AcceptNoWrapTLS()
 		if err != nil {
+			// Conn may be nil if accept failed, or non-nil if the initial
+			// read to figure out if it's TLS or not failed. In the latter
+			// case, close the connection before moving on.
+			if conn != nil {
+				conn.Close()
+			}
 			if debug {
-				log.Println("Listener failed to accept connection from", conn.RemoteAddr(), ". Possibly a TCP Ping.")
+				log.Println("Listener failed to accept:", err)
 			}
 			continue
 		}
@@ -92,9 +97,9 @@ func protocolConnectionHandler(tcpConn net.Conn, config *tls.Config, token strin
 
 	id := syncthingprotocol.NewDeviceID(certs[0].Raw)
 
-	messages := make(chan interface{})
+	messages := make(chan any)
 	errors := make(chan error, 1)
-	outbox := make(chan interface{})
+	outbox := make(chan any)
 
 	// Read messages from the connection and send them on the messages
 	// channel. When there is an error, send it on the error channel and
@@ -179,7 +184,7 @@ func protocolConnectionHandler(tcpConn net.Conn, config *tls.Config, token strin
 					continue
 				}
 				// requestedPeer is the server, id is the client
-				ses := newSession(requestedPeer, id, sessionLimiter, globalLimiter)
+				ses := newSession(requestedPeer, id, sessionLimitBps, globalLimiter)
 
 				go ses.Serve()
 
@@ -359,7 +364,7 @@ func sessionConnectionHandler(conn net.Conn) {
 	}
 }
 
-func messageReader(conn net.Conn, messages chan<- interface{}, errors chan<- error) {
+func messageReader(conn net.Conn, messages chan<- any, errors chan<- error) {
 	numConnections.Add(1)
 	defer numConnections.Add(-1)
 

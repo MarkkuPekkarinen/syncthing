@@ -29,6 +29,14 @@ RUN if [ ! -f syncthing-linux-$TARGETARCH ] ; then \
 FROM alpine
 ARG TARGETARCH
 
+LABEL org.opencontainers.image.authors="The Syncthing Project" \
+      org.opencontainers.image.url="https://syncthing.net" \
+      org.opencontainers.image.documentation="https://docs.syncthing.net" \
+      org.opencontainers.image.source="https://github.com/syncthing/syncthing" \
+      org.opencontainers.image.vendor="The Syncthing Project" \
+      org.opencontainers.image.licenses="MPL-2.0" \
+      org.opencontainers.image.title="Syncthing"
+
 EXPOSE 8384 22000/tcp 22000/udp 21027/udp
 
 VOLUME ["/var/syncthing"]
@@ -44,5 +52,6 @@ HEALTHCHECK --interval=1m --timeout=10s \
   CMD curl -fkLsS -m 2 127.0.0.1:8384/rest/noauth/health | grep -o --color=never OK || exit 1
 
 ENV STGUIADDRESS=0.0.0.0:8384
+ENV STHOMEDIR=/var/syncthing/config
 RUN chmod 755 /bin/entrypoint.sh
-ENTRYPOINT ["/bin/entrypoint.sh", "/bin/syncthing", "-home", "/var/syncthing/config"]
+ENTRYPOINT ["/bin/entrypoint.sh", "/bin/syncthing"]

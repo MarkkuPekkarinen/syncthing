@@ -54,8 +54,8 @@ const windowsDisallowedCharacters = (`<>:"|?*` +
 
 func WindowsInvalidFilename(name string) error {
 	// The path must not contain any disallowed characters.
-	if strings.ContainsAny(name, windowsDisallowedCharacters) {
-		return errInvalidFilenameWindowsReservedChar
+	if idx := strings.IndexAny(name, windowsDisallowedCharacters); idx != -1 {
+		return fmt.Errorf("%w: %q", errInvalidFilenameWindowsReservedChar, name[idx:idx+1])
 	}
 
 	// None of the path components should end in space or period, or be a
@@ -72,8 +72,8 @@ func WindowsInvalidFilename(name string) error {
 			// Names ending in space or period are not valid.
 			return errInvalidFilenameWindowsSpacePeriod
 		}
-		if windowsIsReserved(part) {
-			return errInvalidFilenameWindowsReservedName
+		if reserved := windowsReservedNamePart(part); reserved != "" {
+			return fmt.Errorf("%w: %q", errInvalidFilenameWindowsReservedName, reserved)
 		}
 	}
 
@@ -117,13 +117,13 @@ func SanitizePath(path string) string {
 	}
 
 	path = strings.TrimSpace(b.String())
-	if windowsIsReserved(path) {
+	if reserved := windowsReservedNamePart(path); reserved != "" {
 		path = "-" + path
 	}
 	return path
 }
 
-func windowsIsReserved(part string) bool {
+func windowsReservedNamePart(part string) string {
 	// nul.txt.jpg is also disallowed.
 	dot := strings.IndexByte(part, '.')
 	if dot != -1 {
@@ -132,7 +132,7 @@ func windowsIsReserved(part string) bool {
 
 	// Check length to skip allocating ToUpper.
 	if len(part) != 3 && len(part) != 4 {
-		return false
+		return ""
 	}
 
 	// COM0 and LPT0 are missing from the Microsoft docs,
@@ -144,9 +144,9 @@ func windowsIsReserved(part string) bool {
 		"COM5", "COM6", "COM7", "COM8", "COM9",
 		"LPT0", "LPT1", "LPT2", "LPT3", "LPT4",
 		"LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
-		return true
+		return part
 	}
-	return false
+	return ""
 }
 
 // IsParent compares paths purely lexicographically, meaning it returns false
@@ -169,10 +169,16 @@ func IsParent(path, parent string) bool {
 		// not be caught below.
 		return path != "/"
 	}
-	if parent[len(parent)-1] != PathSeparator {
-		parent += pathSeparatorString
+	if parent[len(parent)-1] == PathSeparator {
+		return strings.HasPrefix(path, parent)
 	}
-	return strings.HasPrefix(path, parent)
+	if !strings.HasPrefix(path, parent) {
+		return false
+	}
+	if len(path) <= len(parent) {
+		return false
+	}
+	return path[len(parent)] == PathSeparator
 }
 
 func CommonPrefix(first, second string) string {
@@ -186,13 +192,10 @@ func CommonPrefix(first, second string) string {
 
 	isAbs := filepath.IsAbs(first) && filepath.IsAbs(second)
 
-	count := len(firstParts)
-	if len(secondParts) < len(firstParts) {
-		count = len(secondParts)
-	}
+	count := min(len(secondParts), len(firstParts))
 
 	common := make([]string, 0, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		if firstParts[i] != secondParts[i] {
 			break
 		}

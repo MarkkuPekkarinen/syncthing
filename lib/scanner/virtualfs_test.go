@@ -115,18 +115,17 @@ type fakeInfo struct {
 }
 
 func (f fakeInfo) Name() string     { return f.name }
-func (fakeInfo) Mode() fs.FileMode  { return 0755 }
+func (fakeInfo) Mode() fs.FileMode  { return 0o755 }
 func (f fakeInfo) Size() int64      { return f.size }
 func (fakeInfo) ModTime() time.Time { return time.Unix(1234567890, 0) }
 func (f fakeInfo) IsDir() bool {
 	return strings.Contains(filepath.Base(f.name), "dir") || f.name == "."
 }
-func (f fakeInfo) IsRegular() bool          { return !f.IsDir() }
-func (fakeInfo) IsSymlink() bool            { return false }
-func (fakeInfo) Owner() int                 { return 0 }
-func (fakeInfo) Group() int                 { return 0 }
-func (fakeInfo) Sys() interface{}           { return nil }
-func (fakeInfo) InodeChangeTime() time.Time { return time.Time{} }
+func (f fakeInfo) IsRegular() bool { return !f.IsDir() }
+func (fakeInfo) IsSymlink() bool   { return false }
+func (fakeInfo) Owner() int        { return 0 }
+func (fakeInfo) Group() int        { return 0 }
+func (fakeInfo) Sys() any          { return nil }
 
 type fakeFile struct {
 	name       string

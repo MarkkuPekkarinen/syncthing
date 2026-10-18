@@ -14,24 +14,24 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/syncthing/syncthing/lib/build"
-	"github.com/syncthing/syncthing/lib/events"
-	"github.com/syncthing/syncthing/lib/osutil"
-	"github.com/syncthing/syncthing/lib/relay/protocol"
-	"github.com/syncthing/syncthing/lib/tlsutil"
 	"golang.org/x/time/rate"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/nat"
+	"github.com/syncthing/syncthing/lib/osutil"
 	_ "github.com/syncthing/syncthing/lib/pmp"
-	_ "github.com/syncthing/syncthing/lib/upnp"
-
 	syncthingprotocol "github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/relay/protocol"
+	"github.com/syncthing/syncthing/lib/tlsutil"
+	_ "github.com/syncthing/syncthing/lib/upnp"
 )
 
 var (
@@ -51,7 +51,6 @@ var (
 	globalLimitBps    int
 	overLimit         atomic.Bool
 	descriptorLimit   int64
-	sessionLimiter    *rate.Limiter
 	globalLimiter     *rate.Limiter
 	networkBufferSize int
 
@@ -72,9 +71,13 @@ var (
 
 // httpClient is the HTTP client we use for outbound requests. It has a
 // timeout and may get further options set during initialization.
-var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
-}
+var (
+	httpTransport = &http.Transport{}
+	httpClient    = &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: httpTransport,
+	}
+)
 
 func main() {
 	log.SetFlags(log.Lshortfile | log.LstdFlags)
@@ -133,9 +136,7 @@ func main() {
 		// also come from that address.
 		laddr.Port = 0
 		boundDialer := &net.Dialer{LocalAddr: laddr}
-		httpClient.Transport = &http.Transport{
-			DialContext: boundDialer.DialContext,
-		}
+		httpTransport.DialContext = boundDialer.DialContext
 	}
 
 	log.Println(longVer)
@@ -158,10 +159,15 @@ func main() {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		log.Println("Failed to load keypair. Generating one, this might take a while...")
-		cert, err = tlsutil.NewCertificate(certFile, keyFile, "strelaysrv", 20*365)
+		cert, err = tlsutil.NewCertificate(certFile, keyFile, "strelaysrv", 20*365, false)
 		if err != nil {
 			log.Fatalln("Failed to generate X509 key pair:", err)
 		}
+	}
+
+	// Outgoing HTTPS requests may use our certificate for authentication
+	httpTransport.TLSClientConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
 	}
 
 	tlsCfg := &tls.Config{
@@ -194,7 +200,15 @@ func main() {
 		cfg.Options.NATTimeoutS = natTimeout
 	})
 	natSvc := nat.NewService(id, wrapper)
-	mapping := mapping{natSvc.NewMapping(nat.TCP, addr.IP, addr.Port)}
+	var ipVersion nat.IPVersion
+	if strings.HasSuffix(proto, "4") {
+		ipVersion = nat.IPv4Only
+	} else if strings.HasSuffix(proto, "6") {
+		ipVersion = nat.IPv6Only
+	} else {
+		ipVersion = nat.IPvAny
+	}
+	mapping := mapping{natSvc.NewMapping(nat.TCP, ipVersion, addr.IP, addr.Port)}
 
 	if natEnabled {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -220,9 +234,6 @@ func main() {
 		}
 	}
 
-	if sessionLimitBps > 0 {
-		sessionLimiter = rate.NewLimiter(rate.Limit(sessionLimitBps), 2*sessionLimitBps)
-	}
 	if globalLimitBps > 0 {
 		globalLimiter = rate.NewLimiter(rate.Limit(globalLimitBps), 2*globalLimitBps)
 	}
@@ -243,10 +254,10 @@ func main() {
 	query.Set("pingInterval", pingInterval.String())
 	query.Set("networkTimeout", networkTimeout.String())
 	if sessionLimitBps > 0 {
-		query.Set("sessionLimitBps", fmt.Sprint(sessionLimitBps))
+		query.Set("sessionLimitBps", strconv.Itoa(sessionLimitBps))
 	}
 	if globalLimitBps > 0 {
-		query.Set("globalLimitBps", fmt.Sprint(globalLimitBps))
+		query.Set("globalLimitBps", strconv.Itoa(globalLimitBps))
 	}
 	if statusAddr != "" {
 		query.Set("statusAddr", statusAddr)
@@ -273,7 +284,7 @@ func main() {
 	for _, pool := range pools {
 		pool = strings.TrimSpace(pool)
 		if len(pool) > 0 {
-			go poolHandler(pool, uri, mapping, cert)
+			go poolHandler(pool, uri, mapping)
 		}
 	}
 

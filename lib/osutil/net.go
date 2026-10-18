@@ -8,23 +8,36 @@ package osutil
 
 import (
 	"net"
+	"strings"
+
+	"github.com/syncthing/syncthing/lib/netutil"
 )
 
-func GetLans() ([]*net.IPNet, error) {
-	ifs, err := net.Interfaces()
+// GetInterfaceAddrs returns the IP networks of all interfaces that are up.
+// Point-to-point interfaces are excluded unless includePtP is true.
+func GetInterfaceAddrs(includePtP bool) ([]*net.IPNet, error) {
+	intfs, err := netutil.Interfaces()
 	if err != nil {
 		return nil, err
 	}
-	addrs := []net.Addr{}
-	for _, currentIf := range ifs {
-		if currentIf.Flags&net.FlagUp != net.FlagUp {
+	var addrs []net.Addr
+
+	for i := range intfs {
+		intf := intfs[i]
+
+		if intf.Flags&net.FlagRunning == 0 {
 			continue
 		}
-		currentAddrs, err := currentIf.Addrs()
+		if !includePtP && intf.Flags&net.FlagPointToPoint != 0 {
+			// Point-to-point interfaces are typically VPNs and similar
+			// which, for our purposes, do not qualify as LANs.
+			continue
+		}
+		intfAddrs, err := netutil.InterfaceAddrsByInterface(&intf)
 		if err != nil {
 			return nil, err
 		}
-		addrs = append(addrs, currentAddrs...)
+		addrs = append(addrs, intfAddrs...)
 	}
 
 	nets := make([]*net.IPNet, 0, len(addrs))
@@ -36,6 +49,17 @@ func GetLans() ([]*net.IPNet, error) {
 		}
 	}
 	return nets, nil
+}
+
+func IPFromString(addr string) net.IP {
+	// strip the port
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	// strip IPv6 zone identifier
+	host, _, _ = strings.Cut(host, "%")
+	return net.ParseIP(host)
 }
 
 func IPFromAddr(addr net.Addr) (net.IP, error) {

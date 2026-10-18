@@ -4,33 +4,30 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:generate -command counterfeiter go run github.com/maxbrunsfeld/counterfeiter/v6
-//go:generate counterfeiter -o mocks/folderSummaryService.go --fake-name FolderSummaryService . FolderSummaryService
+//go:generate go tool counterfeiter -o mocks/folderSummaryService.go --fake-name FolderSummaryService . FolderSummaryService
 
 package model
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/thejerf/suture/v4"
 
+	"github.com/syncthing/syncthing/internal/db"
 	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/svcutil"
-	"github.com/syncthing/syncthing/lib/sync"
 )
-
-const maxDurationSinceLastEventReq = time.Minute
 
 type FolderSummaryService interface {
 	suture.Service
 	Summary(folder string) (*FolderSummary, error)
-	OnEventRequest()
 }
 
 // The folderSummaryService adds summary information events (FolderSummary and
@@ -47,23 +44,17 @@ type folderSummaryService struct {
 	// For keeping track of folders to recalculate for
 	foldersMut sync.Mutex
 	folders    map[string]struct{}
-
-	// For keeping track of when the last event request on the API was
-	lastEventReq    time.Time
-	lastEventReqMut sync.Mutex
 }
 
 func NewFolderSummaryService(cfg config.Wrapper, m Model, id protocol.DeviceID, evLogger events.Logger) FolderSummaryService {
 	service := &folderSummaryService{
-		Supervisor:      suture.New("folderSummaryService", svcutil.SpecWithDebugLogger(l)),
-		cfg:             cfg,
-		model:           m,
-		id:              id,
-		evLogger:        evLogger,
-		immediate:       make(chan string),
-		folders:         make(map[string]struct{}),
-		foldersMut:      sync.NewMutex(),
-		lastEventReqMut: sync.NewMutex(),
+		Supervisor: suture.New("folderSummaryService", svcutil.SpecWithDebugLogger()),
+		cfg:        cfg,
+		model:      m,
+		id:         id,
+		evLogger:   evLogger,
+		immediate:  make(chan string),
+		folders:    make(map[string]struct{}),
 	}
 
 	service.Add(svcutil.AsService(service.listenForUpdates, fmt.Sprintf("%s/listenForUpdates", service)))
@@ -119,8 +110,9 @@ type FolderSummary struct {
 	StateChanged time.Time `json:"stateChanged"`
 	Error        string    `json:"error"`
 
-	Version  int64 `json:"version"` // deprecated
-	Sequence int64 `json:"sequence"`
+	Version        int64                       `json:"version"` // deprecated
+	Sequence       int64                       `json:"sequence"`
+	RemoteSequence map[protocol.DeviceID]int64 `json:"remoteSequence"`
 
 	IgnorePatterns bool   `json:"ignorePatterns"`
 	WatchError     string `json:"watchError"`
@@ -130,29 +122,26 @@ func (c *folderSummaryService) Summary(folder string) (*FolderSummary, error) {
 	res := new(FolderSummary)
 
 	var local, global, need, ro db.Counts
-	var ourSeq, remoteSeq int64
-	errors, err := c.model.FolderErrors(folder)
+	var ourSeq int64
+	var remoteSeq map[protocol.DeviceID]int64
+	errs, err := c.model.FolderErrors(folder)
 	if err == nil {
-		var snap *db.Snapshot
-		if snap, err = c.model.DBSnapshot(folder); err == nil {
-			global = snap.GlobalSize()
-			local = snap.LocalSize()
-			need = snap.NeedSize(protocol.LocalDeviceID)
-			ro = snap.ReceiveOnlyChangedSize()
-			ourSeq = snap.Sequence(protocol.LocalDeviceID)
-			remoteSeq = snap.Sequence(protocol.GlobalDeviceID)
-			snap.Release()
-		}
+		global, _ = c.model.GlobalSize(folder)
+		local, _ = c.model.LocalSize(folder, protocol.LocalDeviceID)
+		need, _ = c.model.NeedSize(folder, protocol.LocalDeviceID)
+		ro, _ = c.model.ReceiveOnlySize(folder)
+		ourSeq, _ = c.model.Sequence(folder, protocol.LocalDeviceID)
+		remoteSeq, _ = c.model.RemoteSequences(folder)
 	}
 	// For API backwards compatibility (SyncTrayzor needs it) an empty folder
 	// summary is returned for not running folders, an error might actually be
 	// more appropriate
-	if err != nil && err != ErrFolderPaused && err != ErrFolderNotRunning {
+	if err != nil && !errors.Is(err, ErrFolderPaused) && !errors.Is(err, ErrFolderNotRunning) {
 		return nil, err
 	}
 
-	res.Errors = len(errors)
-	res.PullErrors = len(errors) // deprecated
+	res.Errors = len(errs)
+	res.PullErrors = len(errs) // deprecated
 
 	res.Invalid = "" // Deprecated, retains external API for now
 
@@ -192,8 +181,9 @@ func (c *folderSummaryService) Summary(folder string) (*FolderSummary, error) {
 		res.Error = err.Error()
 	}
 
-	res.Version = ourSeq + remoteSeq  // legacy
-	res.Sequence = ourSeq + remoteSeq // new name
+	res.Version = ourSeq // legacy
+	res.Sequence = ourSeq
+	res.RemoteSequence = remoteSeq
 
 	ignorePatterns, _, _ := c.model.CurrentIgnores(folder)
 	res.IgnorePatterns = false
@@ -210,12 +200,6 @@ func (c *folderSummaryService) Summary(folder string) (*FolderSummary, error) {
 	}
 
 	return res, nil
-}
-
-func (c *folderSummaryService) OnEventRequest() {
-	c.lastEventReqMut.Lock()
-	c.lastEventReq = time.Now()
-	c.lastEventReqMut.Unlock()
 }
 
 // listenForUpdates subscribes to the event bus and makes note of folders that
@@ -272,7 +256,7 @@ func (c *folderSummaryService) processUpdate(ev events.Event) {
 		return
 
 	case events.DownloadProgress:
-		data := ev.Data.(map[string]map[string]*pullerProgress)
+		data := ev.Data.(map[string]map[string]*PullerProgress)
 		c.foldersMut.Lock()
 		for folder := range data {
 			c.folders[folder] = struct{}{}
@@ -281,7 +265,7 @@ func (c *folderSummaryService) processUpdate(ev events.Event) {
 		return
 
 	case events.StateChanged:
-		data := ev.Data.(map[string]interface{})
+		data := ev.Data.(map[string]any)
 		if data["to"].(string) != "idle" {
 			return
 		}
@@ -312,7 +296,7 @@ func (c *folderSummaryService) processUpdate(ev events.Event) {
 		// This folder needs to be refreshed whenever we do the next
 		// refresh.
 
-		folder = ev.Data.(map[string]interface{})["folder"].(string)
+		folder = ev.Data.(map[string]any)["folder"].(string)
 	}
 
 	c.foldersMut.Lock()
@@ -357,17 +341,6 @@ func (c *folderSummaryService) calculateSummaries(ctx context.Context) error {
 // foldersToHandle returns the list of folders needing a summary update, and
 // clears the list.
 func (c *folderSummaryService) foldersToHandle() []string {
-	// We only recalculate summaries if someone is listening to events
-	// (a request to /rest/events has been made within the last
-	// pingEventInterval).
-
-	c.lastEventReqMut.Lock()
-	last := c.lastEventReq
-	c.lastEventReqMut.Unlock()
-	if time.Since(last) > maxDurationSinceLastEventReq {
-		return nil
-	}
-
 	c.foldersMut.Lock()
 	res := make([]string, 0, len(c.folders))
 	for folder := range c.folders {
@@ -395,6 +368,24 @@ func (c *folderSummaryService) sendSummary(ctx context.Context, folder string) {
 		Folder:  folder,
 		Summary: data,
 	})
+
+	metricFolderSummary.WithLabelValues(folder, metricScopeGlobal, metricTypeFiles).Set(float64(data.GlobalFiles))
+	metricFolderSummary.WithLabelValues(folder, metricScopeGlobal, metricTypeDirectories).Set(float64(data.GlobalDirectories))
+	metricFolderSummary.WithLabelValues(folder, metricScopeGlobal, metricTypeSymlinks).Set(float64(data.GlobalSymlinks))
+	metricFolderSummary.WithLabelValues(folder, metricScopeGlobal, metricTypeDeleted).Set(float64(data.GlobalDeleted))
+	metricFolderSummary.WithLabelValues(folder, metricScopeGlobal, metricTypeBytes).Set(float64(data.GlobalBytes))
+
+	metricFolderSummary.WithLabelValues(folder, metricScopeLocal, metricTypeFiles).Set(float64(data.LocalFiles))
+	metricFolderSummary.WithLabelValues(folder, metricScopeLocal, metricTypeDirectories).Set(float64(data.LocalDirectories))
+	metricFolderSummary.WithLabelValues(folder, metricScopeLocal, metricTypeSymlinks).Set(float64(data.LocalSymlinks))
+	metricFolderSummary.WithLabelValues(folder, metricScopeLocal, metricTypeDeleted).Set(float64(data.LocalDeleted))
+	metricFolderSummary.WithLabelValues(folder, metricScopeLocal, metricTypeBytes).Set(float64(data.LocalBytes))
+
+	metricFolderSummary.WithLabelValues(folder, metricScopeNeed, metricTypeFiles).Set(float64(data.NeedFiles))
+	metricFolderSummary.WithLabelValues(folder, metricScopeNeed, metricTypeDirectories).Set(float64(data.NeedDirectories))
+	metricFolderSummary.WithLabelValues(folder, metricScopeNeed, metricTypeSymlinks).Set(float64(data.NeedSymlinks))
+	metricFolderSummary.WithLabelValues(folder, metricScopeNeed, metricTypeDeleted).Set(float64(data.NeedDeletes))
+	metricFolderSummary.WithLabelValues(folder, metricScopeNeed, metricTypeBytes).Set(float64(data.NeedBytes))
 
 	for _, devCfg := range c.cfg.Folders()[folder].Devices {
 		select {

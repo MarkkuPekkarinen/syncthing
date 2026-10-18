@@ -9,113 +9,222 @@ package api
 import (
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
 	ldap "github.com/go-ldap/ldap/v3"
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
+	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/rand"
-	"github.com/syncthing/syncthing/lib/sync"
 )
 
-var (
-	sessions    = make(map[string]bool)
-	sessionsMut = sync.NewMutex()
+const (
+	maxActiveSessions   = 25
+	randomTokenLength   = 64
+	maxLoginRequestSize = 1 << 10 // one kibibyte for username+password
 )
 
-func emitLoginAttempt(success bool, username, address string, evLogger events.Logger) {
-	evLogger.Log(events.LoginAttempt, map[string]interface{}{
+func emitLoginAttempt(success bool, username string, r *http.Request, evLogger events.Logger) {
+	remoteAddress, proxy := remoteAddress(r)
+	evData := map[string]any{
 		"success":       success,
 		"username":      username,
-		"remoteAddress": address,
-	})
-	if !success {
-		l.Infof("Wrong credentials supplied during API authorization from %s", address)
+		"remoteAddress": remoteAddress,
+	}
+	if proxy != "" {
+		evData["proxy"] = proxy
+	}
+	evLogger.Log(events.LoginAttempt, evData)
+
+	if success {
+		return
+	}
+	l := slog.Default().With(slogutil.Address(remoteAddress), slog.String("username", username))
+	if proxy != "" {
+		l = l.With("proxy", proxy)
+	}
+	l.Warn("Bad credentials supplied during API authorization")
+}
+
+func remoteAddress(r *http.Request) (remoteAddr, proxy string) {
+	remoteAddr = r.RemoteAddr
+	remoteIP := osutil.IPFromString(r.RemoteAddr)
+
+	// parse X-Forwarded-For only if the proxy connects via unix socket, localhost or a LAN IP
+	var localProxy bool
+	if remoteIP != nil {
+		remoteAddr = remoteIP.String()
+		localProxy = remoteIP.IsLoopback() || remoteIP.IsPrivate() || remoteIP.IsLinkLocalUnicast()
+	} else if remoteAddr == "@" {
+		localProxy = true
+	}
+
+	if !localProxy {
+		return
+	}
+
+	forwardedAddr, _, _ := strings.Cut(r.Header.Get("X-Forwarded-For"), ",")
+	forwardedAddr = strings.TrimSpace(forwardedAddr)
+	forwardedIP := osutil.IPFromString(forwardedAddr)
+
+	if forwardedIP != nil {
+		proxy = remoteAddr
+		remoteAddr = forwardedIP.String()
+	}
+	return
+}
+
+func antiBruteForceSleep() {
+	time.Sleep(time.Duration(rand.Intn(100)+100) * time.Millisecond)
+}
+
+func unauthorized(w http.ResponseWriter, shortID string) {
+	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="Authorization Required (%s)"`, shortID))
+	http.Error(w, "Not Authorized", http.StatusUnauthorized)
+}
+
+func forbidden(w http.ResponseWriter) {
+	http.Error(w, "Forbidden", http.StatusForbidden)
+}
+
+func isNoAuthPath(path string, metricsWithoutAuth bool) bool {
+	// Local variable instead of module var to prevent accidental mutation
+	noAuthPaths := []string{
+		"/",
+		"/index.html",
+		"/modal.html",
+		"/rest/svc/lang", // Required to load language settings on login page
+	}
+
+	if metricsWithoutAuth {
+		noAuthPaths = append(noAuthPaths, "/metrics")
+	}
+
+	// Local variable instead of module var to prevent accidental mutation
+	noAuthPrefixes := []string{
+		// Static assets
+		"/assets/",
+		"/syncthing/",
+		"/vendor/",
+		"/theme-assets/", // This leaks information from config, but probably not sensitive
+
+		// No-auth API endpoints
+		"/rest/noauth",
+	}
+
+	return slices.Contains(noAuthPaths, path) ||
+		slices.ContainsFunc(noAuthPrefixes, func(prefix string) bool {
+			return strings.HasPrefix(path, prefix)
+		})
+}
+
+type basicAuthAndSessionMiddleware struct {
+	tokenCookieManager *tokenCookieManager
+	guiCfg             config.GUIConfiguration
+	ldapCfg            config.LDAPConfiguration
+	next               http.Handler
+	evLogger           events.Logger
+}
+
+func newBasicAuthAndSessionMiddleware(tokenCookieManager *tokenCookieManager, guiCfg config.GUIConfiguration, ldapCfg config.LDAPConfiguration, next http.Handler, evLogger events.Logger) *basicAuthAndSessionMiddleware {
+	return &basicAuthAndSessionMiddleware{
+		tokenCookieManager: tokenCookieManager,
+		guiCfg:             guiCfg,
+		ldapCfg:            ldapCfg,
+		next:               next,
+		evLogger:           evLogger,
 	}
 }
 
-func basicAuthAndSessionMiddleware(cookieName string, guiCfg config.GUIConfiguration, ldapCfg config.LDAPConfiguration, next http.Handler, evLogger events.Logger) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if guiCfg.IsValidAPIKey(r.Header.Get("X-API-Key")) {
-			next.ServeHTTP(w, r)
-			return
-		}
+func (m *basicAuthAndSessionMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if hasValidAPIKeyHeader(r, m.guiCfg) {
+		m.next.ServeHTTP(w, r)
+		return
+	}
 
-		// Exception for REST calls that don't require authentication.
-		if strings.HasPrefix(r.URL.Path, "/rest/noauth") {
-			next.ServeHTTP(w, r)
-			return
-		}
+	if m.tokenCookieManager.hasValidSession(r) {
+		m.next.ServeHTTP(w, r)
+		return
+	}
 
-		cookie, err := r.Cookie(cookieName)
-		if err == nil && cookie != nil {
-			sessionsMut.Lock()
-			_, ok := sessions[cookie.Value]
-			sessionsMut.Unlock()
-			if ok {
-				next.ServeHTTP(w, r)
-				return
-			}
-		}
+	// Fall back to Basic auth if provided
+	if username, ok := attemptBasicAuth(r, m.guiCfg, m.ldapCfg, m.evLogger); ok {
+		m.tokenCookieManager.createSession(username, false, w, r)
+		m.next.ServeHTTP(w, r)
+		return
+	}
 
-		l.Debugln("Sessionless HTTP request with authentication; this is expensive.")
+	// Exception for static assets and REST calls that don't require authentication.
+	if isNoAuthPath(r.URL.Path, m.guiCfg.MetricsWithoutAuth) {
+		m.next.ServeHTTP(w, r)
+		return
+	}
 
-		error := func() {
-			time.Sleep(time.Duration(rand.Intn(100)+100) * time.Millisecond)
-			w.Header().Set("WWW-Authenticate", "Basic realm=\"Authorization Required\"")
-			http.Error(w, "Not Authorized", http.StatusUnauthorized)
-		}
+	// Some browsers don't send the Authorization request header unless prompted by a 401 response.
+	// This enables https://user:pass@localhost style URLs to keep working.
+	if m.guiCfg.SendBasicAuthPrompt {
+		unauthorized(w, m.tokenCookieManager.shortID)
+		return
+	}
 
-		username, password, ok := r.BasicAuth()
-		if !ok {
-			error()
-			return
-		}
+	forbidden(w)
+}
 
-		authOk := auth(username, password, guiCfg, ldapCfg)
-		if !authOk {
-			usernameIso := string(iso88591ToUTF8([]byte(username)))
-			passwordIso := string(iso88591ToUTF8([]byte(password)))
-			authOk = auth(usernameIso, passwordIso, guiCfg, ldapCfg)
-			if authOk {
-				username = usernameIso
-			}
-		}
+func (m *basicAuthAndSessionMiddleware) passwordAuthHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username     string
+		Password     string
+		StayLoggedIn bool
+	}
+	if err := unmarshalTo(http.MaxBytesReader(w, r.Body, maxLoginRequestSize), &req); err != nil {
+		l.Debugln("Failed to parse username and password:", err)
+		http.Error(w, "Failed to parse username and password.", http.StatusBadRequest)
+		return
+	}
 
-		if !authOk {
-			emitLoginAttempt(false, username, r.RemoteAddr, evLogger)
-			error()
-			return
-		}
+	if auth(req.Username, req.Password, m.guiCfg, m.ldapCfg) {
+		m.tokenCookieManager.createSession(req.Username, req.StayLoggedIn, w, r)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 
-		sessionid := rand.String(32)
-		sessionsMut.Lock()
-		sessions[sessionid] = true
-		sessionsMut.Unlock()
+	emitLoginAttempt(false, req.Username, r, m.evLogger)
+	antiBruteForceSleep()
+	forbidden(w)
+}
 
-		// Best effort detection of whether the connection is HTTPS --
-		// either directly to us, or as used by the client towards a reverse
-		// proxy who sends us headers.
-		connectionIsHTTPS := r.TLS != nil ||
-			strings.ToLower(r.Header.Get("x-forwarded-proto")) == "https" ||
-			strings.Contains(strings.ToLower(r.Header.Get("forwarded")), "proto=https")
-		// If the connection is HTTPS, or *should* be HTTPS, set the Secure
-		// bit in cookies.
-		useSecureCookie := connectionIsHTTPS || guiCfg.UseTLS()
+func attemptBasicAuth(r *http.Request, guiCfg config.GUIConfiguration, ldapCfg config.LDAPConfiguration, evLogger events.Logger) (string, bool) {
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		return "", false
+	}
 
-		http.SetCookie(w, &http.Cookie{
-			Name:   cookieName,
-			Value:  sessionid,
-			MaxAge: 0,
-			Secure: useSecureCookie,
-		})
+	slog.Debug("Sessionless HTTP request with authentication; this is expensive.")
 
-		emitLoginAttempt(true, username, r.RemoteAddr, evLogger)
-		next.ServeHTTP(w, r)
-	})
+	if auth(username, password, guiCfg, ldapCfg) {
+		return username, true
+	}
+
+	usernameFromIso := string(iso88591ToUTF8([]byte(username)))
+	passwordFromIso := string(iso88591ToUTF8([]byte(password)))
+	if auth(usernameFromIso, passwordFromIso, guiCfg, ldapCfg) {
+		return usernameFromIso, true
+	}
+
+	emitLoginAttempt(false, username, r, evLogger)
+	antiBruteForceSleep()
+	return "", false
+}
+
+func (m *basicAuthAndSessionMiddleware) handleLogout(w http.ResponseWriter, r *http.Request) {
+	m.tokenCookieManager.destroySession(w, r)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func auth(username string, password string, guiCfg config.GUIConfiguration, ldapCfg config.LDAPConfiguration) bool {
@@ -147,23 +256,24 @@ func authLDAP(username string, password string, cfg config.LDAPConfiguration) bo
 	}
 
 	if err != nil {
-		l.Warnln("LDAP Dial:", err)
+		slog.Error("Failed to dial LDAP server", slogutil.Error(err))
 		return false
 	}
 
 	if cfg.Transport == config.LDAPTransportStartTLS {
 		err = connection.StartTLS(&tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify})
 		if err != nil {
-			l.Warnln("LDAP Start TLS:", err)
+			slog.Error("Failed to handshake start TLS With LDAP server", slogutil.Error(err))
 			return false
 		}
 	}
 
 	defer connection.Close()
 
-	err = connection.Bind(ldapTemplateBindDN(cfg.BindDN, username), password)
+	bindDN := formatOptionalPercentS(cfg.BindDN, ldap.EscapeDN(username))
+	err = connection.Bind(bindDN, password)
 	if err != nil {
-		l.Warnln("LDAP Bind:", err)
+		slog.Error("Failed to bind with LDAP server", slogutil.Error(err))
 		return false
 	}
 
@@ -173,7 +283,7 @@ func authLDAP(username string, password string, cfg config.LDAPConfiguration) bo
 	}
 
 	if cfg.SearchFilter == "" || cfg.SearchBaseDN == "" {
-		l.Warnln("LDAP configuration: both searchFilter and searchBaseDN must be set, or neither.")
+		slog.Error("Bad LDAP configuration: both searchFilter and searchBaseDN must be set, or neither")
 		return false
 	}
 
@@ -181,31 +291,31 @@ func authLDAP(username string, password string, cfg config.LDAPConfiguration) bo
 	// the user. If this matches precisely one user then we are good to go.
 	// The search filter uses the same %s interpolation as the bind DN.
 
-	searchString := fmt.Sprintf(cfg.SearchFilter, username)
+	searchString := formatOptionalPercentS(cfg.SearchFilter, ldap.EscapeFilter(username))
 	const sizeLimit = 2  // we search for up to two users -- we only want to match one, so getting any number >1 is a failure.
 	const timeLimit = 60 // Search for up to a minute...
 	searchReq := ldap.NewSearchRequest(cfg.SearchBaseDN, ldap.ScopeWholeSubtree, ldap.DerefFindingBaseObj, sizeLimit, timeLimit, false, searchString, nil, nil)
 
 	res, err := connection.Search(searchReq)
 	if err != nil {
-		l.Warnln("LDAP Search:", err)
+		slog.Warn("Failed LDAP search", slogutil.Error(err))
 		return false
 	}
 	if len(res.Entries) != 1 {
-		l.Infof("Wrong number of LDAP search results, %d != 1", len(res.Entries))
+		slog.Warn("Incorrect number of LDAP search results (expected one)", slog.Int("results", len(res.Entries)))
 		return false
 	}
 
 	return true
 }
 
-func ldapTemplateBindDN(bindDN string, username string) string {
-	// Check if formatting directives are included in the ldapTemplateBindDN - if so add username.
-	// (%%s is a literal %s - unlikely for LDAP, but easy to handle here).
-	if strings.Count(bindDN, "%s") != strings.Count(bindDN, "%%s") {
-		bindDN = fmt.Sprintf(bindDN, username)
+func formatOptionalPercentS(template string, username string) string {
+	var replacements []any
+	nReps := max(strings.Count(template, "%s")-strings.Count(template, "%%s"), 0)
+	for range nReps {
+		replacements = append(replacements, username)
 	}
-	return bindDN
+	return fmt.Sprintf(template, replacements...)
 }
 
 // Convert an ISO-8859-1 encoded byte string to UTF-8. Works by the

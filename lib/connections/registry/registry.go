@@ -11,39 +11,37 @@ package registry
 
 import (
 	"strings"
+	"sync"
 
-	"github.com/syncthing/syncthing/lib/sync"
+	"github.com/syncthing/syncthing/lib/sliceutil"
 )
 
 type Registry struct {
 	mut       sync.Mutex
-	available map[string][]interface{}
+	available map[string][]any
 }
 
 func New() *Registry {
 	return &Registry{
-		mut:       sync.NewMutex(),
-		available: make(map[string][]interface{}),
+		available: make(map[string][]any),
 	}
 }
 
-func (r *Registry) Register(scheme string, item interface{}) {
+func (r *Registry) Register(scheme string, item any) {
 	r.mut.Lock()
 	defer r.mut.Unlock()
 
 	r.available[scheme] = append(r.available[scheme], item)
 }
 
-func (r *Registry) Unregister(scheme string, item interface{}) {
+func (r *Registry) Unregister(scheme string, item any) {
 	r.mut.Lock()
 	defer r.mut.Unlock()
 
 	candidates := r.available[scheme]
 	for i, existingItem := range candidates {
 		if existingItem == item {
-			candidates[i] = candidates[len(candidates)-1]
-			candidates[len(candidates)-1] = nil
-			r.available[scheme] = candidates[:len(candidates)-1]
+			r.available[scheme] = sliceutil.RemoveAndZero(candidates, i)
 			break
 		}
 	}
@@ -51,12 +49,12 @@ func (r *Registry) Unregister(scheme string, item interface{}) {
 
 // Get returns an item for a schema compatible with the given scheme.
 // If any item satisfies preferred, that has precedence over other items.
-func (r *Registry) Get(scheme string, preferred func(interface{}) bool) interface{} {
+func (r *Registry) Get(scheme string, preferred func(any) bool) any {
 	r.mut.Lock()
 	defer r.mut.Unlock()
 
 	var (
-		best       interface{}
+		best       any
 		bestPref   bool
 		bestScheme string
 	)

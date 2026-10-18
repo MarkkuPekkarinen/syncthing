@@ -5,7 +5,6 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //go:build go1.15 && !noquic
-// +build go1.15,!noquic
 
 package connections
 
@@ -39,6 +38,7 @@ func init() {
 
 type quicDialer struct {
 	commonDialer
+
 	registry *registry.Registry
 }
 
@@ -52,27 +52,23 @@ func (d *quicDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL
 		return internalConn{}, err
 	}
 
-	var conn net.PacketConn
-	// We need to track who created the conn.
-	// Given we always pass the connection to quic, it assumes it's a remote connection it never closes it,
-	// So our wrapper around it needs to close it, but it only needs to close it if it's not the listening connection.
+	// If we created the conn we need to close it at the end. If we got a
+	// Transport from the registry we have no conn to close.
 	var createdConn net.PacketConn
-	listenConn := d.registry.Get(uri.Scheme, packetConnUnspecified)
-	if listenConn != nil {
-		conn = listenConn.(net.PacketConn)
-	} else {
+	transport, _ := d.registry.Get(uri.Scheme, transportConnUnspecified).(*quic.Transport)
+	if transport == nil {
 		if packetConn, err := net.ListenPacket("udp", ":0"); err != nil {
 			return internalConn{}, err
 		} else {
-			conn = packetConn
 			createdConn = packetConn
+			transport = &quic.Transport{Conn: packetConn}
 		}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, quicOperationTimeout)
 	defer cancel()
 
-	session, err := quic.DialContext(ctx, conn, addr, uri.Host, d.tlsCfg, quicConfig)
+	session, err := transport.Dial(ctx, addr, d.tlsCfg, quicConfig)
 	if err != nil {
 		if createdConn != nil {
 			_ = createdConn.Close()
@@ -95,26 +91,21 @@ func (d *quicDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL
 	if isLocal {
 		priority = d.lanPriority
 	}
+
 	return newInternalConn(&quicTlsConn{session, stream, createdConn}, connTypeQUICClient, isLocal, priority), nil
 }
 
 type quicDialerFactory struct{}
 
 func (quicDialerFactory) New(opts config.OptionsConfiguration, tlsCfg *tls.Config, registry *registry.Registry, lanChecker *lanChecker) genericDialer {
-	// So the idea is that we should probably try dialing every 20 seconds.
-	// However it would still be nice if this was adjustable/proportional to ReconnectIntervalS
-	// But prevent something silly like 1/3 = 0 etc.
-	quicInterval := opts.ReconnectIntervalS / 3
-	if quicInterval < 10 {
-		quicInterval = 10
-	}
 	return &quicDialer{
 		commonDialer: commonDialer{
-			reconnectInterval: time.Duration(quicInterval) * time.Second,
+			reconnectInterval: time.Duration(opts.ReconnectIntervalS) * time.Second,
 			tlsCfg:            tlsCfg,
+			lanChecker:        lanChecker,
 			lanPriority:       opts.ConnectionPriorityQUICLAN,
 			wanPriority:       opts.ConnectionPriorityQUICWAN,
-			lanChecker:        lanChecker,
+			allowsMultiConns:  true,
 		},
 		registry: registry,
 	}

@@ -10,12 +10,61 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 
 	"github.com/AudriusButkevicius/recli"
+	"github.com/alecthomas/kong"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/urfave/cli"
 )
+
+// Try to mimic the kong output format through custom help templates
+var customAppHelpTemplate = `Usage: {{if .UsageText}}{{.UsageText}}{{else}}{{.HelpName}}{{if .Commands}} <command> [flags]{{end}} {{if .ArgsUsage}}{{.ArgsUsage}}{{else}}[arguments...]{{end}}{{end}}
+
+{{.Description}}{{if .VisibleFlags}}
+
+Flags:
+  {{range $index, $option := .VisibleFlags}}{{if $index}}
+  {{end}}{{$option}}{{end}}{{end}}{{if .VisibleCommands}}
+
+Commands:{{range .VisibleCategories}}{{if .Name}}
+
+  {{.Name}}:{{range .VisibleCommands}}
+    {{join .Names ", "}}{{"\t"}}{{.Usage}}{{end}}{{else}}{{range .VisibleCommands}}
+  {{join .Names ", "}}{{"\t"}}{{.Usage}}{{end}}{{end}}{{end}}{{end}}
+`
+
+var customCommandHelpTemplate = `Usage: {{if .UsageText}}{{.UsageText}}{{else}}{{.HelpName}}{{if .VisibleFlags}} [flags]{{end}} {{if .ArgsUsage}}{{.ArgsUsage}}{{else}}[arguments...]{{end}}{{end}}
+
+{{.Usage}}{{if .VisibleFlags}}
+
+Flags:
+  {{range $index, $option := .VisibleFlags}}{{if $index}}
+  {{end}}{{$option}}{{end}}{{end}}{{if .Category}}
+
+Category:
+  {{.Category}}{{end}}{{if .Description}}
+
+{{.Description}}{{end}}
+`
+
+var customSubcommandHelpTemplate = `Usage: {{if .UsageText}}{{.UsageText}}{{else}}{{.HelpName}} <command>{{if .VisibleFlags}} [flags]{{end}} {{if .ArgsUsage}}{{.ArgsUsage}}{{else}}[arguments...]{{end}}{{end}}{{if .Description}}
+
+{{.Description}}{{else}}{{if .Usage}}
+
+{{.Usage}}{{end}}{{end}}{{if .VisibleFlags}}
+
+Flags:
+  {{range $index, $option := .VisibleFlags}}{{if $index}}
+  {{end}}{{$option}}{{end}}{{end}}{{if .VisibleCommands}}
+
+Commands:{{range .VisibleCategories}}{{if .Name}}
+
+  {{.Name}}:{{range .VisibleCommands}}
+    {{join .Names ", "}}{{"\t"}}{{.Usage}}{{end}}{{else}}{{range .VisibleCommands}}
+  {{join .Names ", "}}{{"\t"}}{{.Usage}}{{end}}{{end}}{{end}}{{end}}
+`
 
 type configHandler struct {
 	original, cfg config.Configuration
@@ -23,9 +72,25 @@ type configHandler struct {
 	err           error
 }
 
-func getConfigCommand(f *apiClientFactory) (cli.Command, error) {
+type configCommand struct {
+	Args []string `arg:"" default:"-h"`
+}
+
+func (c *configCommand) Run(ctx Context, outerCtx *kong.Context) error {
+	app := cli.NewApp()
+	app.Name = "syncthing cli config"
+	app.HelpName = "syncthing cli config"
+	app.Description = outerCtx.Selected().Help
+	app.Metadata = map[string]any{
+		"clientFactory": ctx.clientFactory,
+	}
+	app.CustomAppHelpTemplate = customAppHelpTemplate
+	// Override global templates, as this is out only usage of the package
+	cli.CommandHelpTemplate = customCommandHelpTemplate
+	cli.SubcommandHelpTemplate = customSubcommandHelpTemplate
+
 	h := new(configHandler)
-	h.client, h.err = f.getClient()
+	h.client, h.err = ctx.clientFactory.getClient()
 	if h.err == nil {
 		h.cfg, h.err = getConfig(h.client)
 	}
@@ -38,17 +103,17 @@ func getConfigCommand(f *apiClientFactory) (cli.Command, error) {
 
 	commands, err := recli.New(recliCfg).Construct(&h.cfg)
 	if err != nil {
-		return cli.Command{}, fmt.Errorf("config reflect: %w", err)
+		return fmt.Errorf("config reflect: %w", err)
 	}
 
-	return cli.Command{
-		Name:        "config",
-		HideHelp:    true,
-		Usage:       "Configuration modification command group",
-		Subcommands: commands,
-		Before:      h.configBefore,
-		After:       h.configAfter,
-	}, nil
+	app.Commands = commands
+	app.HideHelp = true
+	// Explicitly re-add help only as flags, not as commands
+	app.Flags = []cli.Flag{cli.HelpFlag}
+	app.Before = h.configBefore
+	app.After = h.configAfter
+
+	return app.Run(append([]string{app.Name}, c.Args...))
 }
 
 func (h *configHandler) configBefore(c *cli.Context) error {
@@ -76,7 +141,7 @@ func (h *configHandler) configAfter(_ *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		body, err := responseToBArray(resp)
 		if err != nil {
 			return err

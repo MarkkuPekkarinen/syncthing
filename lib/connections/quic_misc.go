@@ -4,15 +4,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//go:build go1.15 && !noquic
-// +build go1.15,!noquic
+//go:build !noquic
 
 package connections
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -21,9 +22,8 @@ import (
 )
 
 var quicConfig = &quic.Config{
-	ConnectionIDLength: 4,
-	MaxIdleTimeout:     30 * time.Second,
-	KeepAlivePeriod:    15 * time.Second,
+	MaxIdleTimeout:  30 * time.Second,
+	KeepAlivePeriod: 15 * time.Second,
 }
 
 func quicNetwork(uri *url.URL) string {
@@ -38,15 +38,16 @@ func quicNetwork(uri *url.URL) string {
 }
 
 type quicTlsConn struct {
-	quic.Connection
-	quic.Stream
+	*quic.Conn
+	*quic.Stream
+
 	// If we created this connection, we should be the ones closing it.
 	createdConn net.PacketConn
 }
 
 func (q *quicTlsConn) Close() error {
 	sterr := q.Stream.Close()
-	seerr := q.Connection.CloseWithError(0, "closing")
+	seerr := q.Conn.CloseWithError(0, "closing")
 	var pcerr error
 	if q.createdConn != nil {
 		pcerr = q.createdConn.Close()
@@ -61,11 +62,56 @@ func (q *quicTlsConn) Close() error {
 }
 
 func (q *quicTlsConn) ConnectionState() tls.ConnectionState {
-	return q.Connection.ConnectionState().TLS.ConnectionState
+	return q.Conn.ConnectionState().TLS
 }
 
-func packetConnUnspecified(conn interface{}) bool {
-	addr := conn.(net.PacketConn).LocalAddr()
+func transportConnUnspecified(conn any) bool {
+	tran, ok := conn.(*quic.Transport)
+	if !ok {
+		return false
+	}
+	addr := tran.Conn.LocalAddr()
 	ip, err := osutil.IPFromAddr(addr)
 	return err == nil && ip.IsUnspecified()
+}
+
+// A transportPacketConn is a net.PacketConn that uses a quic.Transport.
+type transportPacketConn struct {
+	tran         *quic.Transport
+	readDeadline atomic.Value // time.Time
+}
+
+func (t *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	ctx := context.Background()
+	if deadline, ok := t.readDeadline.Load().(time.Time); ok && !deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	return t.tran.ReadNonQUICPacket(ctx, p)
+}
+
+func (t *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	return t.tran.WriteTo(p, addr)
+}
+
+func (*transportPacketConn) Close() error {
+	return errUnsupported
+}
+
+func (t *transportPacketConn) LocalAddr() net.Addr {
+	return t.tran.Conn.LocalAddr()
+}
+
+func (t *transportPacketConn) SetDeadline(deadline time.Time) error {
+	return t.SetReadDeadline(deadline)
+}
+
+func (t *transportPacketConn) SetReadDeadline(deadline time.Time) error {
+	t.readDeadline.Store(deadline)
+	return nil
+}
+
+func (*transportPacketConn) SetWriteDeadline(_ time.Time) error {
+	return nil // yolo
 }

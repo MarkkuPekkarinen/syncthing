@@ -27,6 +27,7 @@ func init() {
 
 type tcpDialer struct {
 	commonDialer
+
 	registry *registry.Registry
 }
 
@@ -62,6 +63,7 @@ func (d *tcpDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL)
 	if isLocal {
 		priority = d.lanPriority
 	}
+
 	return newInternalConn(tc, connTypeTCPClient, isLocal, priority), nil
 }
 
@@ -73,9 +75,10 @@ func (tcpDialerFactory) New(opts config.OptionsConfiguration, tlsCfg *tls.Config
 			trafficClass:      opts.TrafficClass,
 			reconnectInterval: time.Duration(opts.ReconnectIntervalS) * time.Second,
 			tlsCfg:            tlsCfg,
+			lanChecker:        lanChecker,
 			lanPriority:       opts.ConnectionPriorityTCPLAN,
 			wanPriority:       opts.ConnectionPriorityTCPWAN,
-			lanChecker:        lanChecker,
+			allowsMultiConns:  true,
 		},
 		registry: registry,
 	}

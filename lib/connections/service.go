@@ -4,25 +4,34 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:generate -command counterfeiter go run github.com/maxbrunsfeld/counterfeiter/v6
-//go:generate counterfeiter -o mocks/service.go --fake-name Service . Service
+//go:generate go tool counterfeiter -o mocks/service.go --fake-name Service . Service
 
 package connections
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base32"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
-	stdsync "sync"
+	"sync"
 	"time"
 
+	"github.com/thejerf/suture/v4"
+
+	"github.com/syncthing/syncthing/internal/slogutil"
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/discover"
@@ -30,16 +39,14 @@ import (
 	"github.com/syncthing/syncthing/lib/nat"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/semaphore"
+	"github.com/syncthing/syncthing/lib/sliceutil"
+	"github.com/syncthing/syncthing/lib/stringutil"
 	"github.com/syncthing/syncthing/lib/svcutil"
-	"github.com/syncthing/syncthing/lib/sync"
-	"github.com/syncthing/syncthing/lib/util"
 
 	// Registers NAT service providers
 	_ "github.com/syncthing/syncthing/lib/pmp"
 	_ "github.com/syncthing/syncthing/lib/upnp"
-
-	"github.com/thejerf/suture/v4"
-	"golang.org/x/time/rate"
 )
 
 var (
@@ -63,12 +70,14 @@ var (
 	errDeviceIgnored          = errors.New("device is ignored")
 	errConnLimitReached       = errors.New("connection limit reached")
 	errDevicePaused           = errors.New("device is paused")
+
+	// A connection is being closed to make space for better ones
+	errReplacingConnection = errors.New("replacing connection")
 )
 
 const (
 	perDeviceWarningIntv          = 15 * time.Minute
 	tlsHandshakeTimeout           = 10 * time.Second
-	minConnectionReplaceAge       = 10 * time.Second
 	minConnectionLoopSleep        = 5 * time.Second
 	stdConnectionLoopSleep        = time.Minute
 	worstDialerPriority           = math.MaxInt32
@@ -76,6 +85,7 @@ const (
 	shortLivedConnectionThreshold = 5 * time.Second
 	dialMaxParallel               = 64
 	dialMaxParallelPerDevice      = 8
+	maxNumConnections             = 128 // the maximum number of connections we maintain to any given device
 )
 
 // From go/src/crypto/tls/cipher_suites.go
@@ -147,6 +157,7 @@ type connWithHello struct {
 type service struct {
 	*suture.Supervisor
 	connectionStatusHandler
+	deviceConnectionTracker
 
 	cfg                  config.Wrapper
 	myID                 protocol.DeviceID
@@ -174,7 +185,7 @@ type service struct {
 }
 
 func NewService(cfg config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *tls.Config, discoverer discover.Finder, bepProtocolName string, tlsDefaultCommonName string, evLogger events.Logger, registry *registry.Registry, keyGen *protocol.KeyGenerator) Service {
-	spec := svcutil.SpecWithInfoLogger(l)
+	spec := svcutil.SpecWithInfoLogger()
 	service := &service{
 		Supervisor:              suture.New("connections.Service", spec),
 		connectionStatusHandler: newConnectionStatusHandler(),
@@ -195,11 +206,9 @@ func NewService(cfg config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *t
 		keyGen:               keyGen,
 		lanChecker:           &lanChecker{cfg},
 
-		dialNowDevicesMut: sync.NewMutex(),
-		dialNow:           make(chan struct{}, 1),
-		dialNowDevices:    make(map[protocol.DeviceID]struct{}),
+		dialNow:        make(chan struct{}, 1),
+		dialNowDevices: make(map[protocol.DeviceID]struct{}),
 
-		listenersMut:   sync.NewRWMutex(),
 		listeners:      make(map[string]genericListener),
 		listenerTokens: make(map[string]suture.ServiceToken),
 	}
@@ -246,7 +255,7 @@ func (s *service) handleConns(ctx context.Context) error {
 		// because there are implementations out there that don't support
 		// protocol negotiation (iOS for one...).
 		if cs.NegotiatedProtocol != s.bepProtocolName {
-			l.Infof("Peer at %s did not negotiate bep/1.0", c)
+			slog.WarnContext(ctx, "Peer at did not negotiate bep/1.0", slogutil.Address(c.RemoteAddr()))
 		}
 
 		// We should have received exactly one certificate from the other
@@ -254,7 +263,7 @@ func (s *service) handleConns(ctx context.Context) error {
 		// connection.
 		certs := cs.PeerCertificates
 		if cl := len(certs); cl != 1 {
-			l.Infof("Got peer certificate list of length %d != 1 from peer at %s; protocol error", cl, c)
+			slog.WarnContext(ctx, "Got peer certificate list of incorrect length", slog.Int("length", cl), slogutil.Address(c.RemoteAddr()))
 			c.Close()
 			continue
 		}
@@ -265,26 +274,48 @@ func (s *service) handleConns(ctx context.Context) error {
 		// though, especially in the presence of NAT hairpinning, multiple
 		// clients between the same NAT gateway, and global discovery.
 		if remoteID == s.myID {
-			l.Debugf("Connected to myself (%s) at %s", remoteID, c)
+			slog.DebugContext(ctx, "Connected to myself", "id", remoteID, "addr", c)
 			c.Close()
 			continue
 		}
 
 		if err := s.connectionCheckEarly(remoteID, c); err != nil {
-			l.Infof("Connection from %s at %s (%s) rejected: %v", remoteID, c.RemoteAddr(), c.Type(), err)
+			slog.DebugContext(ctx, "Connection rejected", remoteID.LogAttr(), slogutil.Address(c.RemoteAddr()), slog.String("type", c.Type()), slogutil.Error(err))
 			c.Close()
 			continue
 		}
 
 		_ = c.SetDeadline(time.Now().Add(20 * time.Second))
 		go func() {
-			hello, err := protocol.ExchangeHello(c, s.model.GetHello(remoteID))
+			// Exchange Hello messages with the peer.
+			outgoing := s.helloForDevice(remoteID)
+			incoming, err := protocol.ExchangeHello(c, outgoing)
+			// The timestamps are used to create the connection ID.
+			c.connectionID = newConnectionID(outgoing.Timestamp, incoming.Timestamp)
+
 			select {
-			case s.hellos <- &connWithHello{c, hello, err, remoteID, remoteCert}:
+			case s.hellos <- &connWithHello{c, incoming, err, remoteID, remoteCert}:
 			case <-ctx.Done():
 			}
 		}()
 	}
+}
+
+func (s *service) helloForDevice(remoteID protocol.DeviceID) protocol.Hello {
+	hello := protocol.Hello{
+		ClientName:    "syncthing",
+		ClientVersion: build.Version,
+		Timestamp:     time.Now().UnixNano(),
+	}
+	if cfg, ok := s.cfg.Device(remoteID); ok {
+		hello.NumConnections = cfg.NumConnections()
+		// Set our name (from the config of our device ID) only if we
+		// already know about the other side device ID.
+		if myCfg, ok := s.cfg.Device(s.myID); ok {
+			hello.DeviceName = myCfg.Name
+		}
+	}
+	return hello
 }
 
 func (s *service) connectionCheckEarly(remoteID protocol.DeviceID, c internalConn) error {
@@ -292,7 +323,7 @@ func (s *service) connectionCheckEarly(remoteID protocol.DeviceID, c internalCon
 		return errDeviceIgnored
 	}
 
-	if max := s.cfg.Options().ConnectionLimitMax; max > 0 && s.model.NumConnections() >= max {
+	if max := s.cfg.Options().ConnectionLimitMax; max > 0 && s.numConnectedDevices() >= max {
 		// We're not allowed to accept any more connections.
 		return errConnLimitReached
 	}
@@ -312,31 +343,26 @@ func (s *service) connectionCheckEarly(remoteID protocol.DeviceID, c internalCon
 		return errNetworkNotAllowed
 	}
 
-	// Lower priority is better, just like nice etc.
-	if ct, ok := s.model.Connection(remoteID); ok {
-		if ct.Priority() > c.priority || time.Since(ct.Statistics().StartedAt) > minConnectionReplaceAge {
-			l.Debugf("Switching connections %s (existing: %s new: %s)", remoteID, ct, c)
-		} else {
-			// We should not already be connected to the other party. TODO: This
-			// could use some better handling. If the old connection is dead but
-			// hasn't timed out yet we may want to drop *that* connection and keep
-			// this one. But in case we are two devices connecting to each other
-			// in parallel we don't want to do that or we end up with no
-			// connections still established...
-			return errDeviceAlreadyConnected
-		}
+	currentConns := s.numConnectionsForDevice(cfg.DeviceID)
+	desiredConns := s.desiredConnectionsToDevice(cfg.DeviceID)
+	worstPrio := s.worstConnectionPriority(remoteID)
+	ourUpgradeThreshold := c.priority + s.cfg.Options().ConnectionPriorityUpgradeThreshold
+	if currentConns >= desiredConns && ourUpgradeThreshold >= worstPrio {
+		l.Debugf("Not accepting connection to %s at %s: already have %d connections, desire %d", remoteID, c, currentConns, desiredConns)
+		return errDeviceAlreadyConnected
 	}
 
 	return nil
 }
 
 func (s *service) handleHellos(ctx context.Context) error {
-	var c internalConn
-	var hello protocol.Hello
-	var err error
-	var remoteID protocol.DeviceID
-	var remoteCert *x509.Certificate
 	for {
+		var c internalConn
+		var hello protocol.Hello
+		var err error
+		var remoteID protocol.DeviceID
+		var remoteCert *x509.Certificate
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -350,22 +376,10 @@ func (s *service) handleHellos(ctx context.Context) error {
 
 		if err != nil {
 			if protocol.IsVersionMismatch(err) {
-				// The error will be a relatively user friendly description
-				// of what's wrong with the version compatibility. By
-				// default identify the other side by device ID and IP.
-				remote := fmt.Sprintf("%v (%v)", remoteID, c.RemoteAddr())
-				if hello.DeviceName != "" {
-					// If the name was set in the hello return, use that to
-					// give the user more info about which device is the
-					// affected one. It probably says more than the remote
-					// IP.
-					remote = fmt.Sprintf("%q (%s %s, %v)", hello.DeviceName, hello.ClientName, hello.ClientVersion, remoteID)
-				}
-				msg := fmt.Sprintf("Connecting to %s: %s", remote, err)
-				warningFor(remoteID, msg)
+				slog.WarnContext(ctx, "Remote device is too old", remoteID.LogAttr(), slogutil.Address(c.RemoteAddr()), slogutil.Error(err))
 			} else {
 				// It's something else - connection reset or whatever
-				l.Infof("Failed to exchange Hello messages with %s at %s: %s", remoteID, c, err)
+				slog.WarnContext(ctx, "Failed to exchange Hello messages", remoteID.LogAttr(), slogutil.Address(c.RemoteAddr()), slogutil.Error(err))
 			}
 			c.Close()
 			continue
@@ -375,14 +389,14 @@ func (s *service) handleHellos(ctx context.Context) error {
 		// The Model will return an error for devices that we don't want to
 		// have a connection with for whatever reason, for example unknown devices.
 		if err := s.model.OnHello(remoteID, c.RemoteAddr(), hello); err != nil {
-			l.Infof("Connection from %s at %s (%s) rejected: %v", remoteID, c.RemoteAddr(), c.Type(), err)
+			slog.WarnContext(ctx, "Connection rejected", remoteID.LogAttr(), slogutil.Address(c.RemoteAddr()), slog.Any("type", c.Type()), slogutil.Error(err))
 			c.Close()
 			continue
 		}
 
 		deviceCfg, ok := s.cfg.Device(remoteID)
 		if !ok {
-			l.Infof("Device %s removed from config during connection attempt at %s", remoteID, c)
+			slog.WarnContext(ctx, "Device removed from config during connection attempt", remoteID.LogAttr(), slogutil.Address(c.RemoteAddr()))
 			c.Close()
 			continue
 		}
@@ -402,7 +416,7 @@ func (s *service) handleHellos(ctx context.Context) error {
 			// Incorrect certificate name is something the user most
 			// likely wants to know about, since it's an advanced
 			// config. Warn instead of Info.
-			l.Warnf("Bad certificate from %s at %s: %v", remoteID, c, err)
+			slog.ErrorContext(ctx, "Bad certificate from remote", remoteID.LogAttr(), slogutil.Address(c.RemoteAddr()), slogutil.Error(err))
 			c.Close()
 			continue
 		}
@@ -412,16 +426,18 @@ func (s *service) handleHellos(ctx context.Context) error {
 		// connections are limited.
 		rd, wr := s.limiter.getLimiters(remoteID, c, c.IsLocal())
 
-		protoConn := protocol.NewConnection(remoteID, rd, wr, c, s.model, c, deviceCfg.Compression, s.cfg.FolderPasswords(remoteID), s.keyGen)
+		protoConn := protocol.NewConnection(remoteID, rd, wr, c, s.model, c, deviceCfg.Compression.ToProtocol(), s.keyGen)
+		s.accountAddedConnection(protoConn, hello, s.cfg.Options().ConnectionPriorityUpgradeThreshold)
 		go func() {
 			<-protoConn.Closed()
+			s.accountRemovedConnection(protoConn)
 			s.dialNowDevicesMut.Lock()
 			s.dialNowDevices[remoteID] = struct{}{}
 			s.scheduleDialNow()
 			s.dialNowDevicesMut.Unlock()
 		}()
 
-		l.Infof("Established secure connection to %s at %s", remoteID, c)
+		slog.InfoContext(ctx, "Established secure connection", remoteID.LogAttr(), slog.Any("connection", c))
 
 		s.model.AddConnection(protoConn, hello)
 		continue
@@ -443,9 +459,9 @@ func (s *service) connect(ctx context.Context) error {
 		bestDialerPriority := s.bestDialerPriority(cfg)
 		isInitialRampup := initialRampup < stdConnectionLoopSleep
 
-		l.Debugln("Connection loop")
+		slog.DebugContext(ctx, "Connection loop")
 		if isInitialRampup {
-			l.Debugln("Connection loop in initial rampup")
+			slog.DebugContext(ctx, "Connection loop in initial rampup")
 		}
 
 		// Used for consistency throughout this loop run, as time passes
@@ -515,7 +531,7 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 	allowAdditional := 0 // no limit
 	connectionLimit := cfg.Options.LowestConnectionLimit()
 	if connectionLimit > 0 {
-		current := s.model.NumConnections()
+		current := s.numConnectedDevices()
 		allowAdditional = connectionLimit - current
 		if allowAdditional <= 0 {
 			l.Debugf("Skipping dial because we've reached the connection limit, current %d >= limit %d", current, connectionLimit)
@@ -542,19 +558,20 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 		// See if we are already connected and, if so, what our cutoff is
 		// for dialer priority.
 		priorityCutoff := worstDialerPriority
-		connection, connected := s.model.Connection(deviceCfg.DeviceID)
-		if connected {
+		if currentConns := s.numConnectionsForDevice(deviceCfg.DeviceID); currentConns > 0 {
 			// Set the priority cutoff to the current connection's priority,
 			// so that we don't attempt any dialers with worse priority.
-			priorityCutoff = connection.Priority()
+			priorityCutoff = s.worstConnectionPriority(deviceCfg.DeviceID)
 
 			// Reduce the priority cutoff by the upgrade threshold, so that
 			// we don't attempt dialers that aren't considered a worthy upgrade.
 			priorityCutoff -= cfg.Options.ConnectionPriorityUpgradeThreshold
 
-			if bestDialerPriority >= priorityCutoff {
+			if bestDialerPriority >= priorityCutoff && currentConns >= s.desiredConnectionsToDevice(deviceCfg.DeviceID) {
 				// Our best dialer is not any better than what we already
-				// have, so nothing to do here.
+				// have, and we already have the desired number of
+				// connections to this device,so nothing to do here.
+				l.Debugf("Skipping dial to %s because we already have %d connections and our best dialer is not better than %d", deviceCfg.DeviceID.Short(), currentConns, priorityCutoff)
 				continue
 			}
 		}
@@ -581,23 +598,21 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 	// Perform dials according to the queue, stopping when we've reached the
 	// allowed additional number of connections (if limited).
 	numConns := 0
-	var numConnsMut stdsync.Mutex
-	dialSemaphore := util.NewSemaphore(dialMaxParallel)
-	dialWG := new(stdsync.WaitGroup)
+	var numConnsMut sync.Mutex
+	dialSemaphore := semaphore.New(dialMaxParallel)
+	dialWG := new(sync.WaitGroup)
 	dialCtx, dialCancel := context.WithCancel(ctx)
 	defer func() {
 		dialWG.Wait()
 		dialCancel()
 	}()
-	for i := range queue {
+	for _, entry := range queue {
 		select {
 		case <-dialCtx.Done():
 			return
 		default:
 		}
-		dialWG.Add(1)
-		go func(entry dialQueueEntry) {
-			defer dialWG.Done()
+		dialWG.Go(func() {
 			conn, ok := s.dialParallel(dialCtx, entry.id, entry.targets, dialSemaphore)
 			if !ok {
 				return
@@ -614,7 +629,7 @@ func (s *service) dialDevices(ctx context.Context, now time.Time, cfg config.Con
 				}
 			}
 			numConnsMut.Unlock()
-		}(queue[i])
+		})
 	}
 }
 
@@ -622,14 +637,14 @@ func (s *service) resolveDialTargets(ctx context.Context, now time.Time, cfg con
 	deviceID := deviceCfg.DeviceID
 
 	addrs := s.resolveDeviceAddrs(ctx, deviceCfg)
-	l.Debugln("Resolved device", deviceID, "addresses:", addrs)
+	l.Debugln("Resolved device", deviceID.Short(), "addresses:", addrs)
 
 	dialTargets := make([]dialTarget, 0, len(addrs))
 	for _, addr := range addrs {
 		// Use both device and address, as you might have two devices connected
 		// to the same relay
 		if !initial && nextDialAt.get(deviceID, addr).After(now) {
-			l.Debugf("Not dialing %s via %v as it's not time yet", deviceID, addr)
+			l.Debugf("Not dialing %s via %v as it's not time yet", deviceID.Short(), addr)
 			continue
 		}
 
@@ -640,7 +655,7 @@ func (s *service) resolveDialTargets(ctx context.Context, now time.Time, cfg con
 		uri, err := url.Parse(addr)
 		if err != nil {
 			s.setConnectionStatus(addr, err)
-			l.Infof("Parsing dialer address %s: %v", addr, err)
+			slog.WarnContext(ctx, "Failed to parse dialer address", slogutil.Address(addr), slogutil.Error(err))
 			continue
 		}
 
@@ -660,14 +675,23 @@ func (s *service) resolveDialTargets(ctx context.Context, now time.Time, cfg con
 			l.Debugf("Dialer for %v: %v", uri, err)
 			continue
 		} else if err != nil {
-			l.Infof("Dialer for %v: %v", uri, err)
+			slog.WarnContext(ctx, "Failed to get dialer", slogutil.URI(uri), slogutil.Error(err))
 			continue
 		}
 
 		dialer := dialerFactory.New(s.cfg.Options(), s.tlsCfg, s.registry, s.lanChecker)
 		priority := dialer.Priority(uri.Host)
-		if priority >= priorityCutoff {
-			l.Debugf("Not dialing using %s as priority is not better than current connection (%d >= %d)", dialerFactory, priority, priorityCutoff)
+		currentConns := s.numConnectionsForDevice(deviceCfg.DeviceID)
+		if priority > priorityCutoff {
+			l.Debugf("Not dialing %s at %s using %s as priority is worse than current connection (%d > %d)", deviceID.Short(), addr, dialerFactory, priority, priorityCutoff)
+			continue
+		}
+		if currentConns > 0 && !dialer.AllowsMultiConns() {
+			l.Debugf("Not dialing %s at %s using %s as it does not allow multiple connections and we already have a connection", deviceID.Short(), addr, dialerFactory)
+			continue
+		}
+		if currentConns >= s.desiredConnectionsToDevice(deviceCfg.DeviceID) && priority == priorityCutoff {
+			l.Debugf("Not dialing %s at %s using %s as priority is equal and we already have %d/%d connections", deviceID.Short(), addr, dialerFactory, currentConns, deviceCfg.NumConnections())
 			continue
 		}
 
@@ -698,7 +722,7 @@ func (s *service) resolveDeviceAddrs(ctx context.Context, cfg config.DeviceConfi
 			addrs = append(addrs, addr)
 		}
 	}
-	return util.UniqueTrimmedStrings(addrs)
+	return stringutil.UniqueTrimmedStrings(addrs)
 }
 
 type lanChecker struct {
@@ -739,6 +763,10 @@ func (s *lanChecker) isLAN(addr net.Addr) bool {
 		return true
 	}
 
+	if ip.IsLinkLocalUnicast() {
+		return true
+	}
+
 	for _, lan := range s.cfg.Options().AlwaysLocalNets {
 		_, ipnet, err := net.ParseCIDR(lan)
 		if err != nil {
@@ -750,7 +778,14 @@ func (s *lanChecker) isLAN(addr net.Addr) bool {
 		}
 	}
 
-	lans, _ := osutil.GetLans()
+	lans, err := osutil.GetInterfaceAddrs(false)
+	if err != nil {
+		l.Debugln("Failed to retrieve interface IPs:", err)
+		priv := ip.IsPrivate()
+		l.Debugf("Assuming isLAN=%v for IP %v", priv, ip)
+		return priv
+	}
+
 	for _, lan := range lans {
 		if lan.Contains(ip) {
 			return true
@@ -763,7 +798,7 @@ func (s *lanChecker) isLAN(addr net.Addr) bool {
 func (s *service) createListener(factory listenerFactory, uri *url.URL) bool {
 	// must be called with listenerMut held
 
-	l.Debugln("Starting listener", uri)
+	slog.Debug("Starting listener", "uri", uri)
 
 	listener := factory.New(uri, s.cfg, s.tlsCfg, s.conns, s.natService, s.registry, s.lanChecker)
 	listener.OnAddressesChanged(s.logListenAddressesChangedEvent)
@@ -771,7 +806,7 @@ func (s *service) createListener(factory listenerFactory, uri *url.URL) bool {
 	// Retrying a listener many times in rapid succession is unlikely to help,
 	// thus back off quickly. A listener may soon be functional again, e.g. due
 	// to a network interface coming back online - retry every minute.
-	spec := svcutil.SpecWithInfoLogger(l)
+	spec := svcutil.SpecWithInfoLogger()
 	spec.FailureThreshold = 2
 	spec.FailureBackoff = time.Minute
 	sup := suture.New(fmt.Sprintf("listenerSupervisor@%v", listener), spec)
@@ -783,7 +818,7 @@ func (s *service) createListener(factory listenerFactory, uri *url.URL) bool {
 }
 
 func (s *service) logListenAddressesChangedEvent(l ListenerAddresses) {
-	s.evLogger.Log(events.ListenAddressesChanged, map[string]interface{}{
+	s.evLogger.Log(events.ListenAddressesChanged, map[string]any{
 		"address": l.URI,
 		"lan":     l.LANAddresses,
 		"wan":     l.WANAddresses,
@@ -793,14 +828,18 @@ func (s *service) logListenAddressesChangedEvent(l ListenerAddresses) {
 func (s *service) CommitConfiguration(from, to config.Configuration) bool {
 	newDevices := make(map[protocol.DeviceID]bool, len(to.Devices))
 	for _, dev := range to.Devices {
+		if dev.DeviceID == s.myID {
+			// Do not report connection metrics for ourselves
+			continue
+		}
+
 		newDevices[dev.DeviceID] = true
+		registerDeviceMetrics(dev.DeviceID.String())
 	}
 
 	for _, dev := range from.Devices {
 		if !newDevices[dev.DeviceID] {
-			warningLimitersMut.Lock()
-			delete(warningLimiters, dev.DeviceID)
-			warningLimitersMut.Unlock()
+			metricDeviceActiveConnections.DeleteLabelValues(dev.DeviceID.String())
 		}
 	}
 
@@ -818,7 +857,7 @@ func (s *service) CommitConfiguration(from, to config.Configuration) bool {
 
 		uri, err := url.Parse(addr)
 		if err != nil {
-			l.Warnf("Skipping malformed listener URL %q: %v", addr, err)
+			slog.Error("Skipping malformed listener URL", slogutil.URI(addr), slogutil.Error(err))
 			continue
 		}
 
@@ -829,7 +868,7 @@ func (s *service) CommitConfiguration(from, to config.Configuration) bool {
 		// mean something entirely different to the computer (e.g.,
 		// tcp:/127.0.0.1:22000 in fact being equivalent to tcp://:22000).
 		if canonical := uri.String(); canonical != addr {
-			l.Warnf("Skipping malformed listener URL %q (not canonical)", addr)
+			slog.Error("Skipping malformed listener URL (not canonical)", slogutil.URI(addr))
 			continue
 		}
 
@@ -843,7 +882,7 @@ func (s *service) CommitConfiguration(from, to config.Configuration) bool {
 			l.Debugf("Listener for %v: %v", uri, err)
 			continue
 		} else if err != nil {
-			l.Infof("Listener for %v: %v", uri, err)
+			slog.Warn("Failed to get listener", slogutil.URI(uri), slogutil.Error(err))
 			continue
 		}
 
@@ -875,7 +914,7 @@ func (s *service) checkAndSignalConnectLoopOnUpdatedDevices(from, to config.Conf
 		if oldDev, ok := oldDevices[dev.DeviceID]; !ok || oldDev.Paused {
 			s.dialNowDevices[dev.DeviceID] = struct{}{}
 			dial = true
-		} else if !util.EqualStrings(oldDev.Addresses, dev.Addresses) {
+		} else if !slices.Equal(oldDev.Addresses, dev.Addresses) {
 			dial = true
 		}
 	}
@@ -905,7 +944,7 @@ func (s *service) AllAddresses() []string {
 		}
 	}
 	s.listenersMut.RUnlock()
-	return util.UniqueTrimmedStrings(addrs)
+	return stringutil.UniqueTrimmedStrings(addrs)
 }
 
 func (s *service) ExternalAddresses() []string {
@@ -920,7 +959,7 @@ func (s *service) ExternalAddresses() []string {
 		}
 	}
 	s.listenersMut.RUnlock()
-	return util.UniqueTrimmedStrings(addrs)
+	return stringutil.UniqueTrimmedStrings(addrs)
 }
 
 func (s *service) ListenerStatus() map[string]ListenerStatusEntry {
@@ -950,17 +989,14 @@ type connectionStatusHandler struct {
 
 func newConnectionStatusHandler() connectionStatusHandler {
 	return connectionStatusHandler{
-		connectionStatusMut: sync.NewRWMutex(),
-		connectionStatus:    make(map[string]ConnectionStatusEntry),
+		connectionStatus: make(map[string]ConnectionStatusEntry),
 	}
 }
 
 func (s *connectionStatusHandler) ConnectionStatus() map[string]ConnectionStatusEntry {
 	result := make(map[string]ConnectionStatusEntry)
 	s.connectionStatusMut.RLock()
-	for k, v := range s.connectionStatus {
-		result[k] = v
-	}
+	maps.Copy(result, s.connectionStatus)
 	s.connectionStatusMut.RUnlock()
 	return result
 }
@@ -1025,24 +1061,6 @@ func urlsToStrings(urls []*url.URL) []string {
 	return strings
 }
 
-var (
-	warningLimiters    = make(map[protocol.DeviceID]*rate.Limiter)
-	warningLimitersMut = sync.NewMutex()
-)
-
-func warningFor(dev protocol.DeviceID, msg string) {
-	warningLimitersMut.Lock()
-	defer warningLimitersMut.Unlock()
-	lim, ok := warningLimiters[dev]
-	if !ok {
-		lim = rate.NewLimiter(rate.Every(perDeviceWarningIntv), 1)
-		warningLimiters[dev] = lim
-	}
-	if lim.Allow() {
-		l.Warnln(msg)
-	}
-}
-
 func tlsTimedHandshake(tc *tls.Conn) error {
 	tc.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
 	defer tc.SetDeadline(time.Time{})
@@ -1079,7 +1097,7 @@ func IsAllowedNetwork(host string, allowed []string) bool {
 	return false
 }
 
-func (s *service) dialParallel(ctx context.Context, deviceID protocol.DeviceID, dialTargets []dialTarget, parentSema *util.Semaphore) (internalConn, bool) {
+func (s *service) dialParallel(ctx context.Context, deviceID protocol.DeviceID, dialTargets []dialTarget, parentSema *semaphore.Semaphore) (internalConn, bool) {
 	// Group targets into buckets by priority
 	dialTargetBuckets := make(map[int][]dialTarget, len(dialTargets))
 	for _, tgt := range dialTargets {
@@ -1093,21 +1111,17 @@ func (s *service) dialParallel(ctx context.Context, deviceID protocol.DeviceID, 
 	}
 
 	// Sort the priorities so that we dial lowest first (which means highest...)
-	sort.Ints(priorities)
+	slices.Sort(priorities)
 
-	sema := util.MultiSemaphore{util.NewSemaphore(dialMaxParallelPerDevice), parentSema}
+	sema := semaphore.MultiSemaphore{semaphore.New(dialMaxParallelPerDevice), parentSema}
 	for _, prio := range priorities {
 		tgts := dialTargetBuckets[prio]
 		res := make(chan internalConn, len(tgts))
-		wg := stdsync.WaitGroup{}
+		wg := sync.WaitGroup{}
 		for _, tgt := range tgts {
 			sema.Take(1)
-			wg.Add(1)
-			go func(tgt dialTarget) {
-				defer func() {
-					wg.Done()
-					sema.Give(1)
-				}()
+			wg.Go(func() {
+				defer sema.Give(1)
 				conn, err := tgt.Dial(ctx)
 				if err == nil {
 					// Closes the connection on error
@@ -1120,7 +1134,7 @@ func (s *service) dialParallel(ctx context.Context, deviceID protocol.DeviceID, 
 					l.Debugln("dialing", deviceID, tgt.uri, "success:", conn)
 					res <- conn
 				}
-			}(tgt)
+			})
 		}
 
 		// Spawn a routine which will unblock main routine in case we fail
@@ -1158,7 +1172,7 @@ func (s *service) validateIdentity(c internalConn, expectedID protocol.DeviceID)
 	// connection.
 	certs := cs.PeerCertificates
 	if cl := len(certs); cl != 1 {
-		l.Infof("Got peer certificate list of length %d != 1 from peer at %s; protocol error", cl, c)
+		slog.Warn("Got peer certificate list of incorrect length", slog.Int("length", cl), slogutil.Address(c.RemoteAddr()))
 		c.Close()
 		return fmt.Errorf("expected 1 certificate, got %d", cl)
 	}
@@ -1226,6 +1240,7 @@ func (r nextDialRegistry) redialDevice(device protocol.DeviceID, now time.Time) 
 		}
 		dev.attempts++
 		dev.nextDial = make(map[string]time.Time)
+		r[device] = dev
 		return
 	}
 	if dev.attempts >= dialCoolDownMaxAttempts && now.Before(dev.coolDownIntervalStart.Add(dialCoolDownDelay)) {
@@ -1268,4 +1283,156 @@ func (r nextDialRegistry) sleepDurationAndCleanup(now time.Time) time.Duration {
 		}
 	}
 	return sleep
+}
+
+func (s *service) desiredConnectionsToDevice(deviceID protocol.DeviceID) int {
+	cfg, ok := s.cfg.Device(deviceID)
+	if !ok {
+		// We want no connections to an unknown device.
+		return 0
+	}
+
+	otherSide := s.wantConnectionsForDevice(deviceID)
+	thisSide := cfg.NumConnections()
+	switch {
+	case otherSide <= 0:
+		// The other side doesn't support multiple connections, or we
+		// haven't yet connected to them so we don't know what they support
+		// or not. Use a single connection until we know better.
+		return 1
+
+	case otherSide == 1:
+		// The other side supports multiple connections, but only wants
+		// one. We should honour that.
+		return 1
+
+	case thisSide == 1:
+		// We want only one connection, so we should honour that.
+		return 1
+
+	// Finally, we allow negotiation and use the higher of the two values,
+	// while keeping at or below the max allowed value.
+	default:
+		return min(max(thisSide, otherSide), maxNumConnections)
+	}
+}
+
+// The deviceConnectionTracker keeps track of how many devices we are
+// connected to and how many connections we have to each device. It also
+// tracks how many connections they are willing to use.
+type deviceConnectionTracker struct {
+	connectionsMut  sync.Mutex
+	connections     map[protocol.DeviceID][]protocol.Connection // current connections
+	wantConnections map[protocol.DeviceID]int                   // number of connections they want
+}
+
+func (c *deviceConnectionTracker) accountAddedConnection(conn protocol.Connection, h protocol.Hello, upgradeThreshold int) {
+	c.connectionsMut.Lock()
+	defer c.connectionsMut.Unlock()
+	// Lazily initialize the maps
+	if c.connections == nil {
+		c.connections = make(map[protocol.DeviceID][]protocol.Connection)
+		c.wantConnections = make(map[protocol.DeviceID]int)
+	}
+	// Add the connection to the list of current connections and remember
+	// how many total connections they want
+	d := conn.DeviceID()
+	c.connections[d] = append(c.connections[d], conn)
+	c.wantConnections[d] = h.NumConnections
+	l.Debugf("Added connection for %s (now %d), they want %d connections", d.Short(), len(c.connections[d]), h.NumConnections)
+
+	// Update active connections metric
+	metricDeviceActiveConnections.WithLabelValues(d.String()).Inc()
+
+	// Close any connections we no longer want to retain.
+	c.closeWorsePriorityConnectionsLocked(d, conn.Priority()-upgradeThreshold)
+}
+
+func (c *deviceConnectionTracker) accountRemovedConnection(conn protocol.Connection) {
+	c.connectionsMut.Lock()
+	defer c.connectionsMut.Unlock()
+	d := conn.DeviceID()
+	cid := conn.ConnectionID()
+	// Remove the connection from the list of current connections
+	for i, conn := range c.connections[d] {
+		if conn.ConnectionID() == cid {
+			c.connections[d] = sliceutil.RemoveAndZero(c.connections[d], i)
+			break
+		}
+	}
+	// Clean up if required
+	if len(c.connections[d]) == 0 {
+		delete(c.connections, d)
+		delete(c.wantConnections, d)
+	}
+
+	// Update active connections metric
+	metricDeviceActiveConnections.WithLabelValues(d.String()).Dec()
+
+	l.Debugf("Removed connection for %s (now %d)", d.Short(), c.connections[d])
+}
+
+func (c *deviceConnectionTracker) numConnectionsForDevice(d protocol.DeviceID) int {
+	c.connectionsMut.Lock()
+	defer c.connectionsMut.Unlock()
+	return len(c.connections[d])
+}
+
+func (c *deviceConnectionTracker) wantConnectionsForDevice(d protocol.DeviceID) int {
+	c.connectionsMut.Lock()
+	defer c.connectionsMut.Unlock()
+	return c.wantConnections[d]
+}
+
+func (c *deviceConnectionTracker) numConnectedDevices() int {
+	c.connectionsMut.Lock()
+	defer c.connectionsMut.Unlock()
+	return len(c.connections)
+}
+
+func (c *deviceConnectionTracker) worstConnectionPriority(d protocol.DeviceID) int {
+	c.connectionsMut.Lock()
+	defer c.connectionsMut.Unlock()
+	if len(c.connections[d]) == 0 {
+		return math.MaxInt // worst possible priority
+	}
+	worstPriority := c.connections[d][0].Priority()
+	for _, conn := range c.connections[d][1:] {
+		if p := conn.Priority(); p > worstPriority {
+			worstPriority = p
+		}
+	}
+	return worstPriority
+}
+
+// closeWorsePriorityConnectionsLocked closes all connections to the given
+// device that are worse than the cutoff priority. Must be called with the
+// lock held.
+func (c *deviceConnectionTracker) closeWorsePriorityConnectionsLocked(d protocol.DeviceID, cutoff int) {
+	for _, conn := range c.connections[d] {
+		if p := conn.Priority(); p > cutoff {
+			l.Debugf("Closing connection %s to %s with priority %d (cutoff %d)", conn, d.Short(), p, cutoff)
+			go conn.Close(errReplacingConnection)
+		}
+	}
+}
+
+// newConnectionID generates a connection ID. The connection ID is designed
+// to be unique for each connection and chronologically sortable. It is
+// based on the sum of two timestamps: when we think the connection was
+// started, and when the other side thinks the connection was started. We
+// then add some random data for good measure. This way, even if the other
+// side does some funny business with the timestamp, we will get no worse
+// than random connection IDs.
+func newConnectionID(t0, t1 int64) string {
+	var buf [16]byte // 8 bytes timestamp, 8 bytes random
+	binary.BigEndian.PutUint64(buf[:], uint64(t0+t1))
+	_, _ = io.ReadFull(rand.Reader, buf[8:])
+	enc := base32.HexEncoding.WithPadding(base32.NoPadding)
+	// We encode the two parts separately and concatenate the results. The
+	// reason for this is that the timestamp (64 bits) doesn't precisely
+	// align to the base32 encoding (5 bits per character), so we'd get a
+	// character in the middle that is a mix of bits from the timestamp and
+	// from the random. We want the timestamp part deterministic.
+	return enc.EncodeToString(buf[:8]) + enc.EncodeToString(buf[8:])
 }

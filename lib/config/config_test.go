@@ -17,11 +17,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/d4l3k/messagediff"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/events"
@@ -61,7 +62,7 @@ func TestDefaultValues(t *testing.T) {
 			LocalAnnMCAddr:            "[ff12::8384]:21027",
 			MaxSendKbps:               0,
 			MaxRecvKbps:               0,
-			ReconnectIntervalS:        60,
+			ReconnectIntervalS:        20,
 			RelaysEnabled:             true,
 			RelayReconnectIntervalM:   10,
 			StartBrowser:              true,
@@ -71,13 +72,11 @@ func TestDefaultValues(t *testing.T) {
 			NATTimeoutS:               10,
 			AutoUpgradeIntervalH:      12,
 			KeepTemporariesH:          24,
-			CacheIgnoredFiles:         false,
 			ProgressUpdateIntervalS:   5,
 			LimitBandwidthInLan:       false,
 			MinHomeDiskFree:           Size{1, "%"},
 			URURL:                     "https://data.syncthing.net/newdata",
 			URInitialDelayS:           1800,
-			URPostInsecurely:          false,
 			ReleasesURL:               "https://upgrades.syncthing.net/meta.json",
 			AlwaysLocalNets:           []string{},
 			OverwriteRemoteDevNames:   false,
@@ -91,6 +90,8 @@ func TestDefaultValues(t *testing.T) {
 			RawStunServers:            []string{"default"},
 			AnnounceLANAddresses:      true,
 			FeatureFlags:              []string{},
+			AuditEnabled:              false,
+			AuditFile:                 "",
 			ConnectionPriorityTCPLAN:  10,
 			ConnectionPriorityQUICLAN: 20,
 			ConnectionPriorityTCPWAN:  30,
@@ -99,34 +100,36 @@ func TestDefaultValues(t *testing.T) {
 		},
 		Defaults: Defaults{
 			Folder: FolderConfiguration{
-				FilesystemType:   fs.FilesystemTypeBasic,
-				Path:             "~",
+				FilesystemType:   FilesystemTypeBasic,
+				Path:             "",
 				Type:             FolderTypeSendReceive,
 				Devices:          []FolderDeviceConfiguration{{DeviceID: device1}},
 				RescanIntervalS:  3600,
 				FSWatcherEnabled: true,
 				FSWatcherDelayS:  10,
 				IgnorePerms:      false,
+				PullerDelayS:     1,
 				AutoNormalize:    true,
 				MinDiskFree:      size,
 				Versioning: VersioningConfiguration{
+					FSType:           FilesystemTypeBasic,
 					CleanupIntervalS: 3600,
 					Params:           map[string]string{},
 				},
-				MaxConflicts:         10,
-				WeakHashThresholdPct: 25,
-				MarkerName:           ".stfolder",
-				MaxConcurrentWrites:  2,
+				MaxConflicts:        10,
+				MarkerName:          ".stfolder",
+				MaxConcurrentWrites: maxConcurrentWritesDefault,
 				XattrFilter: XattrFilter{
 					Entries:            []XattrFilterEntry{},
 					MaxSingleEntrySize: 1024,
 					MaxTotalSize:       4096,
 				},
+				BlockIndexing: true,
 			},
 			Device: DeviceConfiguration{
 				Addresses:       []string{"dynamic"},
 				AllowedNetworks: []string{},
-				Compression:     protocol.CompressionMetadata,
+				Compression:     CompressionMetadata,
 				IgnoredFolders:  []ObservedFolder{},
 			},
 			Ignores: Ignores{
@@ -174,28 +177,33 @@ func TestDeviceConfig(t *testing.T) {
 		expectedFolders := []FolderConfiguration{
 			{
 				ID:               "test",
-				FilesystemType:   fs.FilesystemTypeBasic,
+				FilesystemType:   FilesystemTypeBasic,
 				Path:             "testdata",
 				Devices:          []FolderDeviceConfiguration{{DeviceID: device1}, {DeviceID: device4}},
 				Type:             FolderTypeSendOnly,
 				RescanIntervalS:  600,
-				FSWatcherEnabled: false,
+				FSWatcherEnabled: true,
 				FSWatcherDelayS:  10,
 				Copiers:          0,
 				Hashers:          0,
+				PullerDelayS:     1,
 				AutoNormalize:    true,
 				MinDiskFree:      Size{1, "%"},
 				MaxConflicts:     -1,
 				Versioning: VersioningConfiguration{
-					Params: map[string]string{},
+					CleanupIntervalS: 3600,
+					FSType:           FilesystemTypeBasic,
+					Params:           map[string]string{},
 				},
-				WeakHashThresholdPct: 25,
-				MarkerName:           DefaultMarkerName,
-				JunctionsAsDirs:      true,
-				MaxConcurrentWrites:  maxConcurrentWritesDefault,
+				MarkerName:          DefaultMarkerName,
+				JunctionsAsDirs:     true,
+				MaxConcurrentWrites: maxConcurrentWritesDefault,
 				XattrFilter: XattrFilter{
-					Entries: []XattrFilterEntry{},
+					MaxSingleEntrySize: 1024,
+					MaxTotalSize:       4096,
+					Entries:            []XattrFilterEntry{},
 				},
+				BlockIndexing: true,
 			},
 		}
 
@@ -204,7 +212,7 @@ func TestDeviceConfig(t *testing.T) {
 				DeviceID:        device1,
 				Name:            "node one",
 				Addresses:       []string{"tcp://a"},
-				Compression:     protocol.CompressionMetadata,
+				Compression:     CompressionMetadata,
 				AllowedNetworks: []string{},
 				IgnoredFolders:  []ObservedFolder{},
 			},
@@ -212,7 +220,7 @@ func TestDeviceConfig(t *testing.T) {
 				DeviceID:        device4,
 				Name:            "node two",
 				Addresses:       []string{"tcp://b"},
-				Compression:     protocol.CompressionMetadata,
+				Compression:     CompressionMetadata,
 				AllowedNetworks: []string{},
 				IgnoredFolders:  []ObservedFolder{},
 			},
@@ -268,7 +276,6 @@ func TestOverriddenValues(t *testing.T) {
 		NATTimeoutS:               15,
 		AutoUpgradeIntervalH:      24,
 		KeepTemporariesH:          48,
-		CacheIgnoredFiles:         true,
 		ProgressUpdateIntervalS:   10,
 		LimitBandwidthInLan:       true,
 		MinHomeDiskFree:           Size{5.2, "%"},
@@ -276,7 +283,6 @@ func TestOverriddenValues(t *testing.T) {
 		URAccepted:                4,
 		URURL:                     "https://localhost/newdata",
 		URInitialDelayS:           800,
-		URPostInsecurely:          true,
 		ReleasesURL:               "https://localhost/releases",
 		AlwaysLocalNets:           []string{},
 		OverwriteRemoteDevNames:   true,
@@ -289,6 +295,8 @@ func TestOverriddenValues(t *testing.T) {
 		StunKeepaliveMinS:         900,
 		RawStunServers:            []string{"foo"},
 		FeatureFlags:              []string{"feature"},
+		AuditEnabled:              true,
+		AuditFile:                 "nggyu",
 		ConnectionPriorityTCPLAN:  40,
 		ConnectionPriorityQUICLAN: 45,
 		ConnectionPriorityTCPWAN:  50,
@@ -303,6 +311,11 @@ func TestOverriddenValues(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
+
+	if cfg.Options().URUniqueID == "" {
+		t.Error("expected usage reporting unique ID to be set since usage reporting is enabled")
+	}
+	expected.URUniqueID = cfg.Options().URUniqueID // it's random
 
 	if diff, equal := messagediff.PrettyDiff(expected, cfg.Options()); !equal {
 		t.Errorf("Overridden config differs. Diff:\n%s", diff)
@@ -338,7 +351,7 @@ func TestDeviceAddressesDynamic(t *testing.T) {
 			DeviceID:        device4,
 			Name:            name, // Set when auto created
 			Addresses:       []string{"dynamic"},
-			Compression:     protocol.CompressionMetadata,
+			Compression:     CompressionMetadata,
 			AllowedNetworks: []string{},
 			IgnoredFolders:  []ObservedFolder{},
 		},
@@ -362,21 +375,21 @@ func TestDeviceCompression(t *testing.T) {
 		device1: {
 			DeviceID:        device1,
 			Addresses:       []string{"dynamic"},
-			Compression:     protocol.CompressionMetadata,
+			Compression:     CompressionMetadata,
 			AllowedNetworks: []string{},
 			IgnoredFolders:  []ObservedFolder{},
 		},
 		device2: {
 			DeviceID:        device2,
 			Addresses:       []string{"dynamic"},
-			Compression:     protocol.CompressionMetadata,
+			Compression:     CompressionMetadata,
 			AllowedNetworks: []string{},
 			IgnoredFolders:  []ObservedFolder{},
 		},
 		device3: {
 			DeviceID:        device3,
 			Addresses:       []string{"dynamic"},
-			Compression:     protocol.CompressionNever,
+			Compression:     CompressionNever,
 			AllowedNetworks: []string{},
 			IgnoredFolders:  []ObservedFolder{},
 		},
@@ -384,7 +397,7 @@ func TestDeviceCompression(t *testing.T) {
 			DeviceID:        device4,
 			Name:            name, // Set when auto created
 			Addresses:       []string{"dynamic"},
-			Compression:     protocol.CompressionMetadata,
+			Compression:     CompressionMetadata,
 			AllowedNetworks: []string{},
 			IgnoredFolders:  []ObservedFolder{},
 		},
@@ -427,7 +440,7 @@ func TestDeviceAddressesStatic(t *testing.T) {
 			DeviceID:        device4,
 			Name:            name, // Set when auto created
 			Addresses:       []string{"dynamic"},
-			Compression:     protocol.CompressionMetadata,
+			Compression:     CompressionMetadata,
 			AllowedNetworks: []string{},
 			IgnoredFolders:  []ObservedFolder{},
 		},
@@ -480,7 +493,7 @@ func TestIssue1262(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	actual := cfg.Folders()["test"].Filesystem(nil).URI()
+	actual := cfg.Folders()["test"].Filesystem().URI()
 	expected := `e:\`
 
 	if actual != expected {
@@ -514,10 +527,11 @@ func TestIssue1750(t *testing.T) {
 
 func TestFolderPath(t *testing.T) {
 	folder := FolderConfiguration{
-		Path: "~/tmp",
+		FilesystemType: FilesystemTypeBasic,
+		Path:           "~/tmp",
 	}
 
-	realPath := folder.Filesystem(nil).URI()
+	realPath := folder.Filesystem().URI()
 	if !filepath.IsAbs(realPath) {
 		t.Error(realPath, "should be absolute")
 	}
@@ -550,7 +564,7 @@ func TestFolderCheckPath(t *testing.T) {
 
 	for _, testcase := range testcases {
 		cfg := FolderConfiguration{
-			FilesystemType: fs.FilesystemTypeFake,
+			FilesystemType: FilesystemTypeFake,
 			MarkerName:     DefaultMarkerName,
 		}
 
@@ -770,11 +784,38 @@ func TestGUIConfigURL(t *testing.T) {
 	}
 }
 
+func TestGUISessionCookiePathPrepare(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+		out  string
+	}{
+		{name: "empty stays empty", in: "", out: ""},
+		{name: "already rooted", in: " /gui ", out: "/gui"},
+		{name: "needs slash", in: "gui", out: "/gui"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := GUIConfiguration{SessionCookiePath: tc.in}
+			c.prepare()
+			if c.SessionCookiePath != tc.out {
+				t.Fatalf("unexpected path %q != %q", c.SessionCookiePath, tc.out)
+			}
+		})
+	}
+}
+
 func TestGUIPasswordHash(t *testing.T) {
 	var c GUIConfiguration
 
+	// Setting a plaintext password should work
 	testPass := "pass"
-	if err := c.HashAndSetPassword(testPass); err != nil {
+	if err := c.SetPassword(testPass); err != nil {
 		t.Fatal(err)
 	}
 	if c.Password == testPass {
@@ -788,6 +829,16 @@ func TestGUIPasswordHash(t *testing.T) {
 	failPass := "different"
 	if err := c.CompareHashedPassword(failPass); err == nil {
 		t.Errorf("Match on different password: %v", err)
+	}
+
+	// Setting a bcrypt hash directly should also work
+	hash, err := bcrypt.GenerateFromPassword([]byte("test"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetPassword(string(hash))
+	if err := c.CompareHashedPassword("test"); err != nil {
+		t.Errorf("No match on hashed password: %v", err)
 	}
 }
 
@@ -884,7 +935,7 @@ func TestV14ListenAddressesMigration(t *testing.T) {
 			t.Error("Configuration was not converted")
 		}
 
-		sort.Strings(tc[2])
+		slices.Sort(tc[2])
 		if !reflect.DeepEqual(cfg.Options.RawListenAddresses, tc[2]) {
 			t.Errorf("Migration error; actual %#v != expected %#v", cfg.Options.RawListenAddresses, tc[2])
 		}
@@ -1105,8 +1156,8 @@ func TestInvalidDeviceIDRejected(t *testing.T) {
 
 		// Change the device ID of the first device to "invalid". Fast and loose
 		// with the type assertions as we know what the JSON decoder returns.
-		devs := cfg["devices"].([]interface{})
-		dev0 := devs[0].(map[string]interface{})
+		devs := cfg["devices"].([]any)
+		dev0 := devs[0].(map[string]any)
 		dev0["deviceID"] = tc.id
 		devs[0] = dev0
 
@@ -1144,8 +1195,8 @@ func TestInvalidFolderIDRejected(t *testing.T) {
 		// Change the folder ID of the first folder to the empty string.
 		// Fast and loose with the type assertions as we know what the JSON
 		// decoder returns.
-		devs := cfg["folders"].([]interface{})
-		dev0 := devs[0].(map[string]interface{})
+		devs := cfg["folders"].([]any)
+		dev0 := devs[0].(map[string]any)
 		dev0["id"] = tc.id
 		devs[0] = dev0
 
@@ -1264,14 +1315,14 @@ func adjustDeviceConfiguration(cfg *DeviceConfiguration, id protocol.DeviceID, n
 func adjustFolderConfiguration(cfg *FolderConfiguration, id, label string, fsType fs.FilesystemType, path string) {
 	cfg.ID = id
 	cfg.Label = label
-	cfg.FilesystemType = fsType
+	cfg.FilesystemType = FilesystemType(fsType)
 	cfg.Path = path
 }
 
 // defaultConfigAsMap returns a valid default config as a JSON-decoded
 // map[string]interface{}. This is useful to override random elements and
 // re-encode into JSON.
-func defaultConfigAsMap() map[string]interface{} {
+func defaultConfigAsMap() map[string]any {
 	cfg := New(device1)
 	dev := cfg.Defaults.Device.Copy()
 	adjustDeviceConfiguration(&dev, device2, "name")
@@ -1284,7 +1335,7 @@ func defaultConfigAsMap() map[string]interface{} {
 		// can't happen
 		panic(err)
 	}
-	var tmp map[string]interface{}
+	var tmp map[string]any
 	if err := json.Unmarshal(bs, &tmp); err != nil {
 		// can't happen
 		panic(err)
@@ -1426,11 +1477,10 @@ func TestReceiveEncryptedFolderFixed(t *testing.T) {
 	cfg := Configuration{
 		Folders: []FolderConfiguration{
 			{
-				ID:                 "foo",
-				Path:               "testdata",
-				Type:               FolderTypeReceiveEncrypted,
-				DisableTempIndexes: false,
-				IgnorePerms:        false,
+				ID:          "foo",
+				Path:        "testdata",
+				Type:        FolderTypeReceiveEncrypted,
+				IgnorePerms: false,
 			},
 		},
 	}
@@ -1441,9 +1491,6 @@ func TestReceiveEncryptedFolderFixed(t *testing.T) {
 		t.Fatal("Expected one folder")
 	}
 	f := cfg.Folders[0]
-	if !f.DisableTempIndexes {
-		t.Error("DisableTempIndexes should be true")
-	}
 	if !f.IgnorePerms {
 		t.Error("IgnorePerms should be true")
 	}
@@ -1596,4 +1643,62 @@ func handleFile(name string) {
 	origin, _ := os.ReadFile(filepath.Join("testdata", name))
 	fd.Write(origin)
 	fd.Close()
+}
+
+func TestCopyMatching(t *testing.T) {
+	type Nested struct {
+		A int
+	}
+	type Test struct {
+		CopyA  int
+		CopyB  []string
+		CopyC  Nested
+		CopyD  *Nested
+		NoCopy int `restart:"true"`
+	}
+
+	from := Test{
+		CopyA: 1,
+		CopyB: []string{"friend", "foe"},
+		CopyC: Nested{
+			A: 2,
+		},
+		CopyD: &Nested{
+			A: 3,
+		},
+		NoCopy: 4,
+	}
+
+	to := Test{
+		CopyA: 11,
+		CopyB: []string{"foot", "toe"},
+		CopyC: Nested{
+			A: 22,
+		},
+		CopyD: &Nested{
+			A: 33,
+		},
+		NoCopy: 44,
+	}
+
+	// Copy empty fields
+	copyMatchingTag(&from, &to, "restart", func(v string) bool {
+		return v != "true"
+	})
+
+	if to.CopyA != 1 {
+		t.Error("CopyA")
+	}
+	if len(to.CopyB) != 2 || to.CopyB[0] != "friend" || to.CopyB[1] != "foe" {
+		t.Error("CopyB")
+	}
+	if to.CopyC.A != 2 {
+		t.Error("CopyC")
+	}
+	if to.CopyD.A != 3 {
+		t.Error("CopyC")
+	}
+	if to.NoCopy != 44 {
+		t.Error("NoCopy")
+	}
 }

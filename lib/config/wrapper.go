@@ -4,24 +4,27 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:generate -command counterfeiter go run github.com/maxbrunsfeld/counterfeiter/v6
-//go:generate counterfeiter -o mocks/mocked_wrapper.go --fake-name Wrapper . Wrapper
+//go:generate go tool counterfeiter -o mocks/mocked_wrapper.go --fake-name Wrapper . Wrapper
 
 package config
 
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/thejerf/suture/v4"
+
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/sync"
-	"github.com/thejerf/suture/v4"
+	"github.com/syncthing/syncthing/lib/sliceutil"
 )
 
 const (
@@ -149,7 +152,6 @@ func Wrap(path string, cfg Configuration, myID protocol.DeviceID, evLogger event
 		myID:     myID,
 		queue:    make(chan modifyEntry, maxModifications),
 		waiter:   noopWaiter{}, // Noop until first config change
-		mut:      sync.NewMutex(),
 	}
 	return w
 }
@@ -198,9 +200,7 @@ func (w *wrapper) Unsubscribe(c Committer) {
 	w.mut.Lock()
 	for i := range w.subs {
 		if w.subs[i] == c {
-			copy(w.subs[i:], w.subs[i+1:])
-			w.subs[len(w.subs)-1] = nil
-			w.subs = w.subs[:len(w.subs)-1]
+			w.subs = sliceutil.RemoveAndZero(w.subs, i)
 			break
 		}
 	}
@@ -297,7 +297,7 @@ func (w *wrapper) serveSave() {
 		return
 	}
 	if err := w.Save(); err != nil {
-		l.Warnln("Failed to save config:", err)
+		slog.Error("Failed to save config", slogutil.Error(err))
 	}
 }
 
@@ -328,13 +328,11 @@ func (w *wrapper) replaceLocked(to Configuration) (Waiter, error) {
 }
 
 func (w *wrapper) notifyListeners(from, to Configuration) Waiter {
-	wg := sync.NewWaitGroup()
-	wg.Add(len(w.subs))
+	wg := new(sync.WaitGroup)
 	for _, sub := range w.subs {
-		go func(committer Committer) {
-			w.notifyListener(committer, from, to)
-			wg.Done()
-		}(sub)
+		wg.Go(func() {
+			w.notifyListener(sub, from, to)
+		})
 	}
 	return wg
 }

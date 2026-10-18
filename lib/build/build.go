@@ -12,11 +12,23 @@ import (
 	"os"
 	"regexp"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+var buildInfo = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: "syncthing",
+	Subsystem: "build",
+	Name:      "info",
+	Help:      "A metric with a constant '1' value labeled by version information from when the binary was built.",
+}, []string{"program", "version", "codename", "goversion", "builduser", "builddate", "tags"})
+
+const Codename = "Hafnium Hornet"
 
 var (
 	// Injected by build script
@@ -26,8 +38,8 @@ var (
 	Stamp   = "0"
 	Tags    = ""
 
-	// Static
-	Codename = "Fermium Flea"
+	// Added to by other packages
+	extraTags []string
 
 	// Set by init()
 	Date        time.Time
@@ -35,16 +47,24 @@ var (
 	IsCandidate bool
 	IsBeta      bool
 	LongVersion string
+	Extra       string
 
-	allowedVersionExp = regexp.MustCompile(`^v\d+\.\d+\.\d+(-[a-z0-9]+)*(\.\d+)*(\+\d+-g[0-9a-f]+)?(-[^\s]+)?$`)
+	allowedVersionExp = regexp.MustCompile(`^v\d+\.\d+\.\d+(-[a-z0-9]+)*(\.\d+)*(\+\d+-g[0-9a-f]+|\+[0-9a-z]+)?(-[^\s]+)?$`)
 
 	envTags = []string{
 		"STGUIASSETS",
-		"STHASHING",
 		"STNORESTART",
 		"STNOUPGRADE",
 	}
+	replaceTags = map[string]string{
+		"sqlite_omit_load_extension": "",
+		"sqlite_dbstat":              "",
+		"netgo":                      "",
+		"osusergo":                   "",
+	}
 )
+
+const versionExtraAllowedChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-. "
 
 func init() {
 	if Version != "unknown-dev" {
@@ -75,6 +95,7 @@ func setBuildData() {
 	IsRelease = exp.MatchString(Version)
 	IsCandidate = strings.Contains(Version, "-rc.")
 	IsBeta = strings.Contains(Version, "-")
+	Extra = filterString(os.Getenv("STVERSIONEXTRA"), versionExtraAllowedChars)
 
 	stamp, _ := strconv.Atoi(Stamp)
 	Date = time.Unix(int64(stamp), 0)
@@ -87,10 +108,27 @@ func LongVersionFor(program string) string {
 	date := Date.UTC().Format("2006-01-02 15:04:05 MST")
 	v := fmt.Sprintf(`%s %s "%s" (%s %s-%s) %s@%s %s`, program, Version, Codename, runtime.Version(), runtime.GOOS, runtime.GOARCH, User, Host, date)
 
-	if tags := TagsList(); len(tags) > 0 {
+	tags := TagsList()
+	if len(tags) > 0 {
 		v = fmt.Sprintf("%s [%s]", v, strings.Join(tags, ", "))
 	}
+
+	buildInfo.Reset()
+	buildInfo.With(prometheus.Labels{
+		"program":   program,
+		"version":   Version,
+		"codename":  Codename,
+		"goversion": runtime.Version(),
+		"builduser": fmt.Sprintf("%s@%s", User, Host),
+		"builddate": Date.UTC().Format("2006-01-02 15:04:05 MST"),
+		"tags":      strings.Join(tags, ","),
+	}).Set(1)
+
 	return v
+}
+
+func UserAgent() string {
+	return fmt.Sprintf(`Syncthing/%s (%s %s-%s)`, strings.TrimPrefix(Version, "v"), runtime.Version(), runtime.GOOS, runtime.GOARCH)
 }
 
 func TagsList() []string {
@@ -103,7 +141,43 @@ func TagsList() []string {
 			tags = append(tags, strings.ToLower(envVar))
 		}
 	}
+	if Extra != "" {
+		tags = append(tags, Extra)
+	}
+	tags = append(tags, extraTags...)
 
-	sort.Strings(tags)
+	// Replace any tag values we want to have more user friendly versions,
+	// or be removed
+	for i, tag := range tags {
+		if repl, ok := replaceTags[tag]; ok {
+			tags[i] = repl
+		}
+	}
+
+	slices.Sort(tags)
+
+	// Remove any empty tags, which will be at the front of the list now
+	for len(tags) > 0 && tags[0] == "" {
+		tags = tags[1:]
+	}
+
+	tags = slices.Compact(tags)
 	return tags
+}
+
+// filterString returns a copy of s with all characters not in allowedChars
+// removed.
+func filterString(s, allowedChars string) string {
+	var res strings.Builder
+	for _, c := range s {
+		if strings.ContainsRune(allowedChars, c) {
+			res.WriteRune(c)
+		}
+	}
+	return res.String()
+}
+
+func AddTag(tag string) {
+	extraTags = append(extraTags, tag)
+	LongVersion = LongVersionFor("syncthing")
 }

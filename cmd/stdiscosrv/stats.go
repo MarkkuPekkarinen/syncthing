@@ -7,10 +7,9 @@
 package main
 
 import (
-	"os"
+	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
 var (
@@ -90,35 +89,68 @@ var (
 			Help:       "Latency of database operations.",
 			Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
 		}, []string{"operation"})
+
+	databaseWriteSeconds = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "syncthing",
+			Subsystem: "discovery",
+			Name:      "database_write_seconds",
+			Help:      "Time spent writing the database.",
+		})
+	databaseLastWritten = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "syncthing",
+			Subsystem: "discovery",
+			Name:      "database_last_written",
+			Help:      "Timestamp of the last successful database write.",
+		})
+
+	retryAfterLevel = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "syncthing",
+			Subsystem: "discovery",
+			Name:      "retry_after_seconds",
+			Help:      "Retry-After header value in seconds.",
+		}, []string{"name"})
 )
 
 const (
-	dbOpGet             = "get"
-	dbOpPut             = "put"
-	dbOpMerge           = "merge"
-	dbOpDelete          = "delete"
-	dbResSuccess        = "success"
-	dbResNotFound       = "not_found"
-	dbResError          = "error"
-	dbResUnmarshalError = "unmarsh_err"
+	dbOpGet       = "get"
+	dbOpPut       = "put"
+	dbOpMerge     = "merge"
+	dbResSuccess  = "success"
+	dbResNotFound = "not_found"
 )
 
 func init() {
-	prometheus.MustRegister(apiRequestsTotal, apiRequestsSeconds,
+	prometheus.MustRegister(
+		apiRequestsTotal, apiRequestsSeconds,
 		lookupRequestsTotal, announceRequestsTotal,
 		replicationSendsTotal, replicationRecvsTotal,
 		databaseKeys, databaseStatisticsSeconds,
-		databaseOperations, databaseOperationSeconds)
+		databaseOperations, databaseOperationSeconds,
+		databaseWriteSeconds, databaseLastWritten,
+		retryAfterLevel)
 
-	processCollectorOpts := collectors.ProcessCollectorOpts{
-		Namespace: "syncthing_discovery",
-		PidFn: func() (int, error) {
-			return os.Getpid(), nil
-		},
-	}
+	// Prewarm important counters so they're available with zero values at
+	// startup
 
-	prometheus.MustRegister(
-		collectors.NewProcessCollector(processCollectorOpts),
-	)
+	apiRequestsTotal.WithLabelValues(http.MethodGet, "200")
+	apiRequestsTotal.WithLabelValues(http.MethodGet, "404")
+	apiRequestsTotal.WithLabelValues(http.MethodPost, "204")
+	apiRequestsTotal.WithLabelValues(http.MethodPost, "400")
+	apiRequestsTotal.WithLabelValues(http.MethodPost, "403")
+	apiRequestsTotal.WithLabelValues(http.MethodPost, "413")
 
+	lookupRequestsTotal.WithLabelValues("success")
+	lookupRequestsTotal.WithLabelValues("not_found_ever")
+	lookupRequestsTotal.WithLabelValues("not_found_recent")
+
+	announceRequestsTotal.WithLabelValues("success")
+	announceRequestsTotal.WithLabelValues("bad_request")
+	announceRequestsTotal.WithLabelValues("request_too_large")
+	announceRequestsTotal.WithLabelValues("no_certificate")
+
+	replicationSendsTotal.WithLabelValues("success")
+	replicationRecvsTotal.WithLabelValues("success")
 }

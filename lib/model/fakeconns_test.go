@@ -12,8 +12,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/syncthing/syncthing/internal/timeutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	protocolmocks "github.com/syncthing/syncthing/lib/protocol/mocks"
+	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/scanner"
 )
 
@@ -29,17 +31,19 @@ func newFakeConnection(id protocol.DeviceID, model Model) *fakeConnection {
 		model:      model,
 		closed:     make(chan struct{}),
 	}
-	f.RequestCalls(func(ctx context.Context, folder, name string, blockNo int, offset int64, size int, hash []byte, weakHash uint32, fromTemporary bool) ([]byte, error) {
-		return f.fileData[name], nil
+	f.RequestCalls(func(ctx context.Context, req *protocol.Request) ([]byte, error) {
+		return f.fileData[req.Name], nil
 	})
-	f.IDReturns(id)
+	f.DeviceIDReturns(id)
+	f.ConnectionIDReturns(rand.String(16))
 	f.CloseCalls(func(err error) {
 		f.closeOnce.Do(func() {
 			close(f.closed)
+			model.Closed(f, err)
 		})
-		model.Closed(id, err)
 		f.ClosedReturns(f.closed)
 	})
+	f.StringReturns(rand.String(8))
 	return f
 }
 
@@ -57,26 +61,28 @@ type fakeConnection struct {
 }
 
 func (f *fakeConnection) setIndexFn(fn func(_ context.Context, folder string, fs []protocol.FileInfo) error) {
-	f.IndexCalls(fn)
-	f.IndexUpdateCalls(fn)
-}
-
-func (f *fakeConnection) DownloadProgress(_ context.Context, folder string, updates []protocol.FileDownloadProgressUpdate) {
-	f.downloadProgressMessages = append(f.downloadProgressMessages, downloadProgressMessage{
-		folder:  folder,
-		updates: updates,
+	f.IndexCalls(func(ctx context.Context, idx *protocol.Index) error { return fn(ctx, idx.Folder, idx.Files) })
+	f.IndexUpdateCalls(func(ctx context.Context, idxUp *protocol.IndexUpdate) error {
+		return fn(ctx, idxUp.Folder, idxUp.Files)
 	})
 }
 
-func (f *fakeConnection) addFileLocked(name string, flags uint32, ftype protocol.FileInfoType, data []byte, version protocol.Vector, localFlags uint32) {
+func (f *fakeConnection) DownloadProgress(_ context.Context, dp *protocol.DownloadProgress) {
+	f.downloadProgressMessages = append(f.downloadProgressMessages, downloadProgressMessage{
+		folder:  dp.Folder,
+		updates: dp.Updates,
+	})
+}
+
+func (f *fakeConnection) addFileLocked(name string, flags uint32, ftype protocol.FileInfoType, data []byte, version protocol.Vector, localFlags protocol.FlagLocal) {
 	blockSize := protocol.BlockSize(int64(len(data)))
-	blocks, _ := scanner.Blocks(context.TODO(), bytes.NewReader(data), blockSize, int64(len(data)), nil, true)
+	blocks, _ := scanner.Blocks(context.TODO(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
 
 	file := protocol.FileInfo{
 		Name:       name,
 		Type:       ftype,
 		Version:    version,
-		Sequence:   time.Now().UnixNano(),
+		Sequence:   timeutil.StrictlyMonotonicNanos(),
 		LocalFlags: localFlags,
 	}
 	switch ftype {
@@ -85,14 +91,14 @@ func (f *fakeConnection) addFileLocked(name string, flags uint32, ftype protocol
 		file.Permissions = flags
 		if ftype == protocol.FileInfoTypeFile {
 			file.Size = int64(len(data))
-			file.RawBlockSize = blockSize
+			file.RawBlockSize = int32(blockSize)
 			file.Blocks = blocks
 		}
 	default: // Symlink
 		file.Name = name
 		file.Type = ftype
 		file.Version = version
-		file.SymlinkTarget = string(data)
+		file.SymlinkTarget = data
 		file.NoPermissions = true
 	}
 	f.files = append(f.files, file)
@@ -101,15 +107,6 @@ func (f *fakeConnection) addFileLocked(name string, flags uint32, ftype protocol
 		f.fileData = make(map[string][]byte)
 	}
 	f.fileData[name] = data
-}
-
-func (f *fakeConnection) addFileWithLocalFlags(name string, ftype protocol.FileInfoType, localFlags uint32) {
-	f.mut.Lock()
-	defer f.mut.Unlock()
-
-	var version protocol.Vector
-	version = version.Update(f.id.Short())
-	f.addFileLocked(name, 0, ftype, nil, version, localFlags)
 }
 
 func (f *fakeConnection) addFile(name string, flags uint32, ftype protocol.FileInfoType, data []byte) {
@@ -143,7 +140,7 @@ func (f *fakeConnection) deleteFile(name string) {
 			fi.Deleted = true
 			fi.ModifiedS = time.Now().Unix()
 			fi.Version = fi.Version.Update(f.id.Short())
-			fi.Sequence = time.Now().UnixNano()
+			fi.Sequence = timeutil.StrictlyMonotonicNanos()
 			fi.Blocks = nil
 
 			f.files = append(append(f.files[:i], f.files[i+1:]...), fi)
@@ -157,7 +154,7 @@ func (f *fakeConnection) sendIndexUpdate() {
 	for i := range f.files {
 		toSend[i] = prepareFileInfoForIndex(f.files[i])
 	}
-	f.model.IndexUpdate(f.id, f.folder, toSend)
+	f.model.IndexUpdate(f, &protocol.IndexUpdate{Folder: f.folder, Files: toSend})
 }
 
 func addFakeConn(m *testModel, dev protocol.DeviceID, folderID string) *fakeConnection {
@@ -165,7 +162,7 @@ func addFakeConn(m *testModel, dev protocol.DeviceID, folderID string) *fakeConn
 	fc.folder = folderID
 	m.AddConnection(fc, protocol.Hello{})
 
-	m.ClusterConfig(dev, protocol.ClusterConfig{
+	m.ClusterConfig(fc, &protocol.ClusterConfig{
 		Folders: []protocol.Folder{
 			{
 				ID: folderID,

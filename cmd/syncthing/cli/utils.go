@@ -17,9 +17,6 @@ import (
 	"path/filepath"
 
 	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/db/backend"
-	"github.com/syncthing/syncthing/lib/locations"
-	"github.com/urfave/cli"
 )
 
 func responseToBArray(response *http.Response) ([]byte, error) {
@@ -30,68 +27,72 @@ func responseToBArray(response *http.Response) ([]byte, error) {
 	return bytes, response.Body.Close()
 }
 
-func emptyPost(url string) cli.ActionFunc {
-	return func(c *cli.Context) error {
-		client, err := getClientFactory(c).getClient()
-		if err != nil {
-			return err
-		}
-		_, err = client.Post(url, "")
+func emptyPost(url string, apiClientFactory *apiClientFactory) error {
+	client, err := apiClientFactory.getClient()
+	if err != nil {
 		return err
+	}
+	_, err = client.Post(url, "")
+	return err
+}
+
+func indexDumpOutputWrapper(apiClientFactory *apiClientFactory) func(url string) error {
+	return func(url string) error {
+		return indexDumpOutput(url, apiClientFactory)
 	}
 }
 
-func indexDumpOutput(url string) cli.ActionFunc {
-	return func(c *cli.Context) error {
-		client, err := getClientFactory(c).getClient()
-		if err != nil {
-			return err
-		}
-		response, err := client.Get(url)
-		if errors.Is(err, errNotFound) {
-			return errors.New("not found (folder/file not in database)")
-		}
-		if err != nil {
-			return err
-		}
-		return prettyPrintResponse(response)
-	}
-}
-
-func saveToFile(url string) cli.ActionFunc {
-	return func(c *cli.Context) error {
-		client, err := getClientFactory(c).getClient()
-		if err != nil {
-			return err
-		}
-		response, err := client.Get(url)
-		if err != nil {
-			return err
-		}
-		_, params, err := mime.ParseMediaType(response.Header.Get("Content-Disposition"))
-		if err != nil {
-			return err
-		}
-		filename := params["filename"]
-		if filename == "" {
-			return errors.New("Missing filename in response")
-		}
-		bs, err := responseToBArray(response)
-		if err != nil {
-			return err
-		}
-		f, err := os.Create(filename)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		_, err = f.Write(bs)
-		if err != nil {
-			return err
-		}
-		fmt.Println("Wrote results to", filename)
+func indexDumpOutput(url string, apiClientFactory *apiClientFactory) error {
+	client, err := apiClientFactory.getClient()
+	if err != nil {
 		return err
 	}
+	response, err := client.Get(url)
+	if errors.Is(err, errNotFound) {
+		return errors.New("not found (folder/file not in database)")
+	}
+	if err != nil {
+		return err
+	}
+	return prettyPrintResponse(response)
+}
+
+func saveToFile(url string, apiClientFactory *apiClientFactory) error {
+	client, err := apiClientFactory.getClient()
+	if err != nil {
+		return err
+	}
+	response, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	_, params, err := mime.ParseMediaType(response.Header.Get("Content-Disposition"))
+	if err != nil {
+		return err
+	}
+	filename := params["filename"]
+	if filename == "" {
+		return errors.New("Missing filename in response")
+	}
+	bs, err := responseToBArray(response)
+	if err != nil {
+		return err
+	}
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(bs)
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
+	err = f.Close()
+	if err != nil {
+		return err
+	}
+	fmt.Println("Wrote results to", filename)
+	return nil
 }
 
 func getConfig(c APIClient) (config.Configuration, error) {
@@ -111,20 +112,7 @@ func getConfig(c APIClient) (config.Configuration, error) {
 	return cfg, nil
 }
 
-func expects(n int, actionFunc cli.ActionFunc) cli.ActionFunc {
-	return func(ctx *cli.Context) error {
-		if ctx.NArg() != n {
-			plural := ""
-			if n != 1 {
-				plural = "s"
-			}
-			return fmt.Errorf("expected %d argument%s, got %d", n, plural, ctx.NArg())
-		}
-		return actionFunc(ctx)
-	}
-}
-
-func prettyPrintJSON(data interface{}) error {
+func prettyPrintJSON(data any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(data)
@@ -135,7 +123,7 @@ func prettyPrintResponse(response *http.Response) error {
 	if err != nil {
 		return err
 	}
-	var data interface{}
+	var data any
 	if err := json.Unmarshal(bytes, &data); err != nil {
 		return err
 	}
@@ -143,23 +131,6 @@ func prettyPrintResponse(response *http.Response) error {
 	return prettyPrintJSON(data)
 }
 
-func getDB() (backend.Backend, error) {
-	return backend.OpenLevelDBRO(locations.Get(locations.Database))
-}
-
-func nulString(bs []byte) string {
-	for i := range bs {
-		if bs[i] == 0 {
-			return string(bs[:i])
-		}
-	}
-	return string(bs)
-}
-
 func normalizePath(path string) string {
 	return filepath.ToSlash(filepath.Clean(path))
-}
-
-func getClientFactory(c *cli.Context) *apiClientFactory {
-	return c.App.Metadata["clientFactory"].(*apiClientFactory)
 }

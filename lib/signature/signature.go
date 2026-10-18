@@ -11,16 +11,16 @@ package signature
 import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
-	"fmt"
 	"io"
 	"math/big"
 
 	"github.com/syncthing/syncthing/lib/rand"
-	"github.com/syncthing/syncthing/lib/sha256"
 )
 
 // GenerateKeys returns a new key pair, with the private and public key
@@ -135,7 +135,7 @@ func hashReader(r io.Reader) ([]byte, error) {
 	if _, err := io.Copy(h, r); err != nil {
 		return nil, err
 	}
-	hash := []byte(fmt.Sprintf("%x", h.Sum(nil)))
+	hash := []byte(hex.EncodeToString(h.Sum(nil)))
 	return hash, nil
 }
 
